@@ -557,11 +557,17 @@ class VoiceConversation:
             await self._apply_cue(cue)
 
     async def _apply_cue(self, cue: plan.Cue) -> None:
-        if cue.expression is None:
-            await asyncio.to_thread(self.hardware.set_state, cue.state.value)
+        if isinstance(cue, plan.Gesture):
+            await asyncio.to_thread(self.hardware.gesture, cue.name)
         else:
             await asyncio.to_thread(self.hardware.set_state, cue.state.value,
-                                    expression=cue.expression.value)
+                                    expression=cue.expression and cue.expression.value)
+
+    def _pose_expression(self, state: str, expression: str | None) -> str | None:
+        if state != "thinking" or expression is not None:
+            return expression
+        lean = self._planner.resting(plan.State.THINKING).expression
+        return lean and lean.value
 
     def _has_output(self) -> bool:
         return (self._speech_pending > 0 or self._speaker_lock.locked() or self._output_busy
@@ -1527,7 +1533,7 @@ class VoiceConversation:
                 raise _SpeechSuperseded
             if progress:
                 await hardware_call(self.hardware.cue_progress)
-            await hardware_call(self.hardware.set_state, state, expression=expression)
+            await hardware_call(self.hardware.set_state, state, expression=self._pose_expression(state, expression))
             if is_current is not None and not is_current():
                 raise _SpeechSuperseded
             if on_start is not None:
@@ -1543,7 +1549,7 @@ class VoiceConversation:
             await hardware_call(self.hardware.set_state, "listening")
             log.info("Reachy speech paused for microphone input")
         async def resume() -> None:
-            await hardware_call(self.hardware.set_state, state, expression=expression)
+            await hardware_call(self.hardware.set_state, state, expression=self._pose_expression(state, expression))
             log.info("Reachy speech resumed after microphone silence")
         async def push(samples) -> None:
             nonlocal samples_played
@@ -1602,7 +1608,8 @@ class VoiceConversation:
             await player.finish()
             if not stream_segment:
                 await asyncio.sleep(.25)
-                await hardware_call(self.hardware.set_state, "thinking")
+                await hardware_call(self.hardware.set_state, "thinking",
+                                    expression=self._pose_expression("thinking", None))
             log.info("Reachy spoke %.1f seconds of %s",
                      samples_played / self.hardware.output_sample_rate,
                      _SPEECH_LABELS[line.role][1])

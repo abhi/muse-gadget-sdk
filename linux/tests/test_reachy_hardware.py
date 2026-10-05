@@ -287,33 +287,50 @@ def test_reply_pose_matches_the_emotion():
     assert controller._pose_parameters(thoughtful)["roll"] == pytest.approx(12)
 
 
-def test_listening_and_thinking_gestures_play_once_then_rest_in_the_state_pose():
+@pytest.mark.parametrize("state, gesture, age, axis, expected", [
+    ("listening", "nod", .45, "pitch", 5),
+    ("thinking", "nod", .45, "pitch", 5),
+    ("listening", "tilt", .8, "roll", 10),
+])
+def test_gestures_layer_on_the_resting_pose(state, gesture, age, axis, expected):
     controller = ReachyController(pose_factory=pose_factory)
     controller._np = np
-    def head(state, age, expression):
-        return controller._pose_parameters(controller._state_pose(state, age, expression)[0])
-    assert head("listening", .45, "nod")["pitch"] == pytest.approx(8)
-    assert head("thinking", .45, "nod")["pitch"] == pytest.approx(8)
-    assert head("listening", .8, "listening")["roll"] == pytest.approx(10)
-    for state in ("listening", "thinking"):
-        np.testing.assert_allclose(controller._state_pose(state, 2, "nod")[0],
-                                   controller._state_pose(state, 2)[0], atol=1e-12)
-    np.testing.assert_allclose(controller._state_pose("listening", 2, "listening")[0],
-                               controller._state_pose("listening", 2)[0], atol=1e-12)
-    assert head("thinking", 0, "curious")["roll"] == pytest.approx(10)
-    assert head("thinking", 0, None)["roll"] == pytest.approx(0)
+    resting, _ = controller._state_pose(state, age)
+    pose = controller._gesture_pose(resting, gesture, age)
+    assert controller._pose_parameters(pose)[axis] == pytest.approx(expected)
+    np.testing.assert_allclose(controller._gesture_pose(resting, gesture, 2), resting)
 
 
-def test_repeating_a_gesture_restarts_it(monkeypatch):
+def test_gesture_survives_speech_onset_and_preserves_the_expression(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(reachy_hardware, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     controller = ReachyController(pose_factory=pose_factory)
-    clock = iter([10.0, 20.0, 30.0, 40.0])
-    monkeypatch.setattr("musegadget.reachy_hardware.time.monotonic", lambda: next(clock))
+    controller._np = np
+    controller.set_state("thinking", expression="curious")
+    controller.gesture("nod")
+    assert (controller._state, controller._reply_expression) == ("thinking", "curious")
+    clock[0] = 10.1
+    controller.set_state("speaking", expression="happy")
+    clock[0] = 11.05
+    resting, _ = controller._state_pose("speaking", clock[0] - controller._state_started, "happy")
+    pose = controller._gesture_pose(resting, controller._gesture_name, clock[0] - controller._gesture_started)
+    coordinates = controller._pose_parameters(pose)
+    assert coordinates["pitch"] == pytest.approx(-8)
+    assert coordinates["roll"] < -5
+    assert coordinates["z"] > 4
+    assert controller._gesture_started == 10
+    controller.gesture("nod")
+    assert controller._gesture_started == 11.05
+
+
+def test_thinking_variations_keep_the_glance_clock(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(reachy_hardware, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    controller = ReachyController(pose_factory=pose_factory)
     controller.set_state("thinking")
-    controller.set_state("thinking")
-    assert controller._state_started == 10.0
-    controller.set_state("listening", expression="nod")
-    controller.set_state("listening", expression="nod")
-    assert controller._state_started == 30.0
+    clock[0] = 15
+    controller.set_state("thinking", expression="curious")
+    assert controller._state_started == 10
 
 
 def test_unmarked_speech_stays_neutral_instead_of_taking_the_thinking_pose():
@@ -403,7 +420,7 @@ def test_pose_smoothing_keeps_the_same_response_when_target_write_frequency_chan
 
 
 @pytest.mark.parametrize("expression, axis, minimum_range", [("nod", "pitch", 4), ("shake", "yaw", 5)])
-def test_inline_speech_gesture_yields_face_gaze_and_keeps_audio_and_a_single_writer(
+def test_gesture_keeps_face_tracking_audio_and_a_single_writer(
         expression, axis, minimum_range):
     robot = FakeRobot()
     robot.media.get_frame = lambda: None
@@ -439,13 +456,15 @@ def test_inline_speech_gesture_yields_face_gaze_and_keeps_audio_and_a_single_wri
             assert time.monotonic() < deadline
             time.sleep(.01)
         started = time.monotonic()
-        controller.set_state("speaking", expression=expression)
+        controller.gesture(expression)
         controller.play_audio(np.ones(80, dtype=np.float32))
         assert robot.media.output and time.monotonic() - started < .1
-        while controller._face_follower.active:
-            assert time.monotonic() - started < .2
-            time.sleep(.005)
+        while time.monotonic() - started < .6:
+            assert controller._face_follower.active
+            time.sleep(.01)
+        controller.set_state("speaking")
         while time.monotonic() - started < 1.8:
+            assert controller._face_follower.active
             time.sleep(.01)
         frames = [frame for frame in robot.frames if started <= frame[0] <= started + 1.6]
         coordinates = [controller._pose_parameters(frame[1]) for frame in frames]
@@ -470,12 +489,11 @@ def test_speech_gesture_holds_calibrated_peaks_and_returns_to_the_original_gaze(
     for age, offset in ((0, 0), (.25, amplitude), (.35, amplitude), (.45, amplitude),
                         (.95, -amplitude), (1.05, -amplitude), (1.15, -amplitude),
                         (1.6, 0), (2, 0)):
-        pose, ears = controller._state_pose("speaking", age, expression, gesture_anchor=anchor)
+        pose = controller._gesture_pose(pose_factory(yaw=anchor[0], pitch=anchor[1]), expression, age)
         coordinates = controller._pose_parameters(pose)
         assert coordinates[axis] == pytest.approx(anchor_angle + offset)
         assert coordinates["pitch" if axis == "yaw" else "yaw"] == pytest.approx(
             anchor[1 if axis == "yaw" else 0])
-        np.testing.assert_allclose(np.rad2deg(ears), [-10, 10])
 
 
 @pytest.mark.parametrize("expression", ["nod", "shake"])
@@ -484,7 +502,7 @@ def test_speech_gesture_respects_absolute_bounds_when_face_gaze_is_near_the_limi
     controller = ReachyController(pose_factory=pose_factory)
     controller._np = np
     for age in np.arange(0, 1.7, .025):
-        pose, _ = controller._state_pose("speaking", age, expression, gesture_anchor=anchor)
+        pose = controller._gesture_pose(pose_factory(yaw=anchor[0], pitch=anchor[1]), expression, age)
         coordinates = controller._pose_parameters(pose)
         assert abs(coordinates["yaw"]) <= 20 + 1e-9
         assert abs(coordinates["pitch"]) <= 12 + 1e-9

@@ -9,15 +9,15 @@ import math
 from typing import Callable, Dict, Optional, Tuple, Union
 
 from musegadget.reachy_capabilities import Expression
+from musegadget.reachy_hardware import GESTURE_DURATION_S
 
 
 TILT_WORDS = 3                 # new words heard before Reachy tilts its head to show it follows
-GESTURE_GAP_S = 1.5            # quiet time after any gesture before a listening tilt or nod
+GESTURE_GAP_S = GESTURE_DURATION_S  # a listening tilt or nod waits for the previous gesture to finish
 NOD_EVERY_S = 3.0              # at most one listening nod this often
 PAUSE_S = 0.6                  # an unchanged transcript this long counts as a clause end
 CLAUSE_WORDS = ("and", "so")   # a transcript ending in one of these words ends a clause
 VARY_EVERY_S = 4.0             # at most one change of thinking motion this often
-GOT_IT_GAP_S = 1.0             # the "got it" nod waits this long after any gesture
 
 
 class State(str, Enum):
@@ -30,13 +30,19 @@ class State(str, Enum):
 
 @dataclass(frozen=True)
 class SetState:
-    """Hold a state. A NOD or LISTENING expression is a gesture: it plays once, then the state rests."""
-
     state: State
     expression: Optional[Expression] = None
 
 
-Cue = SetState
+@dataclass(frozen=True)
+class Gesture:
+    name: str
+
+
+NOD = "nod"
+TILT = "tilt"
+
+Cue = Union[SetState, Gesture]
 
 
 @dataclass(frozen=True)
@@ -158,6 +164,7 @@ class ExpressionPlanner:
         self._status_shown: Optional[Tuple[str, Optional[str]]] = None
         self._varied_at = -math.inf
         self._variations = 0
+        self._thinking_expression: Optional[Expression] = None
         self._handlers: Dict[type, Callable[..., Tuple[Cue, ...]]] = {
             Started: self._started,
             WakeHeard: self._wake_heard,
@@ -177,13 +184,18 @@ class ExpressionPlanner:
     def on(self, event: Event, now: float) -> Tuple[Cue, ...]:
         cues = self._handlers[type(event)](event, now)
         for cue in cues:
-            self._state = cue.state
+            if isinstance(cue, SetState):
+                self._state = cue.state
         return cues
 
-    def _gesture(self, expression: Expression, now: float) -> Tuple[Cue, ...]:
+    def resting(self, state: State) -> SetState:
+        """The cue that holds ``state``; thinking keeps the lean Muse's work last chose."""
+        return SetState(state, self._thinking_expression if state is State.THINKING else None)
+
+    def _gesture(self, name: str, now: float) -> Tuple[Cue, ...]:
         self._gesture_at = now
         self._words_at_gesture = len(self._heard.text.split())
-        return (SetState(self._state, expression),)
+        return (Gesture(name),)
 
     def _started(self, event: Started, now: float) -> Tuple[Cue, ...]:
         return (SetState(State.IDLE),)
@@ -209,19 +221,20 @@ class ExpressionPlanner:
         if event.speaking:
             return (SetState(State.LISTENING),) if event.output or event.turn_running else ()
         if not event.output and (event.turn_running or event.turns_waiting):
-            return (SetState(State.THINKING),)
+            return (self.resting(State.THINKING),)
         return ()
 
     def _working(self, event: Working, now: float) -> Tuple[Cue, ...]:
         if event.output or event.user_speaking:
             return ()
-        return (SetState(State.THINKING),)
+        return (self.resting(State.THINKING),)
 
     def _turn_started(self, event: TurnStarted, now: float) -> Tuple[Cue, ...]:
         self._answered = False
         self._status_shown = None
         self._varied_at = -math.inf
         self._variations = 0
+        self._thinking_expression = None
         return self._working(Working(event.output, event.user_speaking), now)
 
     def _partial(self, event: Partial, now: float) -> Tuple[Cue, ...]:
@@ -239,9 +252,9 @@ class ExpressionPlanner:
         if clause_end and event.revision != self._nodded_revision and now - self._nod_at >= NOD_EVERY_S:
             self._nodded_revision = event.revision
             self._nod_at = now
-            return self._gesture(Expression.NOD, now)
+            return self._gesture(NOD, now)
         if len(words) - self._words_at_gesture >= TILT_WORDS:
-            return self._gesture(Expression.LISTENING, now)
+            return self._gesture(TILT, now)
         return ()
 
     def _muse_status(self, event: MuseStatus, now: float) -> Tuple[Cue, ...]:
@@ -252,16 +265,17 @@ class ExpressionPlanner:
         self._status_shown = shown
         self._varied_at = now
         self._variations += 1
-        return (SetState(State.THINKING, Expression.CURIOUS if self._variations % 2 else Expression.THINKING),)
+        self._thinking_expression = Expression.CURIOUS if self._variations % 2 else Expression.THINKING
+        return (self.resting(State.THINKING),)
 
     def _answer_arrived(self, event: AnswerArrived, now: float) -> Tuple[Cue, ...]:
         if self._answered:
             return ()
         self._answered = True
-        if event.output or self._state is not State.THINKING or now - self._gesture_at < GOT_IT_GAP_S:
+        if event.output or self._state is not State.THINKING or now - self._gesture_at < GESTURE_GAP_S:
             return ()
         self._nod_at = now
-        return self._gesture(Expression.NOD, now)
+        return self._gesture(NOD, now)
 
     def _turn_done(self, event: TurnDone, now: float) -> Tuple[Cue, ...]:
         if event.turns_waiting or event.output:
@@ -272,5 +286,5 @@ class ExpressionPlanner:
         if event.user_speaking:
             return (SetState(State.LISTENING),)
         if event.turn_open:
-            return (SetState(State.THINKING),)
+            return (self.resting(State.THINKING),)
         return (SetState(State.LISTENING if event.wake_open else State.IDLE),)

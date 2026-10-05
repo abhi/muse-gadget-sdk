@@ -61,6 +61,10 @@ class PinHardware(FakeHardware):
         self.recording.add({"robot": "set_state", "state": state, "expression": expression})
         super().set_state(state, expression=expression)
 
+    def gesture(self, name):
+        self.recording.add({"robot": "gesture", "name": name})
+        super().gesture(name)
+
     def play_audio(self, samples):
         event = {"robot": "play", "audio": self.recording.label(samples)}
         if self.recording.events[-1:] != [event]:

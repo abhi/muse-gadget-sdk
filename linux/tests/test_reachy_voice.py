@@ -618,7 +618,7 @@ def test_preemption_finishes_pending_hardware_call_before_flush_and_answer(
                 super().play_audio(samples)
 
             def set_state(self, state, **kwargs):
-                if blocked_call == "set_state" and state == "thinking" and "expression" in kwargs:
+                if blocked_call == "set_state" and self.progress_cues and not entered.is_set():
                     entered.set()
                     assert release.wait(2)
                     calls.append("progress pose finished")
@@ -1002,8 +1002,8 @@ def test_streaming_first_frame_plays_before_done_and_expressions_match_playback(
         assert hardware.play_expressions == [("speaking", "surprised"), ("speaking", gesture)]
         assert hardware.commands == []
         assert speech.closed == speech.requests
-        assert [state for state in hardware.state_expressions if state[0] == "thinking"] == [
-            ("thinking", None), ("thinking", "nod")]
+        assert [state for state in hardware.state_expressions if state[0] == "thinking"] == [("thinking", None)]
+        assert hardware.gestures == ["nod"]
     asyncio.run(bounded(scenario()))
 
 
@@ -2767,6 +2767,7 @@ class FakeHardware:
         self.play_expressions = []
         self.cleared = 0
         self.progress_cues = 0
+        self.gestures = []
         self.samples = queue.Queue()
         self.read_count = 0
         self.commands = []
@@ -2785,6 +2786,9 @@ class FakeHardware:
 
     def clear_audio(self):
         self.cleared += 1
+
+    def gesture(self, name):
+        self.gestures.append(name)
 
     def cue_progress(self):
         self.progress_cues += 1
@@ -2913,8 +2917,9 @@ def test_ack_race_and_multiple_messages_play_real_mp3_once_each(mp3_tone, monkey
         assert session.sent == [(b"voice recording", "robot-chat")]
         assert session.tts_requests == ["reply-1", "reply-2"]
         assert session.tts_closed == ["reply-1", "reply-2"]
-        assert hardware.state_expressions == [("thinking", None), ("thinking", "nod"), ("speaking", None),
+        assert hardware.state_expressions == [("thinking", None), ("speaking", None),
                                               ("thinking", None), ("speaking", None), ("thinking", None)]
+        assert hardware.gestures == ["nod"]
         pcm = np.concatenate(hardware.played)
         assert pcm.ndim == 1
         assert np.isfinite(pcm).all()
@@ -3245,8 +3250,8 @@ def test_real_noise_voice_note_gets_text_completion_and_paced_tts_burst(mp3_tone
                 data=mp3_tone[offset:offset + 3], end_body=offset + 3 >= len(mp3_tone),
             )))
         await speaking
-        assert hardware.state_expressions == [("thinking", None), ("thinking", "nod"), ("speaking", None),
-                                              ("thinking", None)]
+        assert hardware.state_expressions == [("thinking", None), ("speaking", None), ("thinking", None)]
+        assert hardware.gestures == ["nod"]
         assert sum(len(samples) for samples in hardware.played) >= 640
         assert not conversation._muted
         await cancel_task(subscriber)
@@ -3263,7 +3268,7 @@ def test_initial_motion_failure_restores_capture_and_releases_tracker(monkeypatc
     monkeypatch.setattr(reachy_voice, "ECHO_TAIL_S", 0)
 
     class FailedHardware(FakeHardware):
-        def set_state(self, state):
+        def set_state(self, state, *, expression=None):
             raise RuntimeError("motion hardware disconnected")
 
     async def scenario():

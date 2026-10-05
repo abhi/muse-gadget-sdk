@@ -2,16 +2,15 @@ import pytest
 
 from musegadget.reachy_capabilities import Expression
 from musegadget.reachy_expression_plan import (
-    AnswerArrived, CaptureGap, ExpressionPlanner, MuseStatus, OutputIdle, Partial, Recording, SetState,
+    AnswerArrived, CaptureGap, ExpressionPlanner, Gesture, MuseStatus, OutputIdle, Partial, Recording, SetState,
     Started, State, TurnDone, TurnStarted, UserSpeech, WakeClosed, WakeHeard, Working,
 )
 
 IDLE = SetState(State.IDLE)
 LISTENING = SetState(State.LISTENING)
 THINKING = SetState(State.THINKING)
-TILT = SetState(State.LISTENING, Expression.LISTENING)
-NOD = SetState(State.LISTENING, Expression.NOD)
-GOT_IT = SetState(State.THINKING, Expression.NOD)
+TILT = Gesture("tilt")
+NOD = Gesture("nod")
 CURIOUS = SetState(State.THINKING, Expression.CURIOUS)
 PONDER = SetState(State.THINKING, Expression.THINKING)
 
@@ -77,22 +76,23 @@ def test_resting_states(script, expected):
 
 
 LISTENING_GESTURES = {
-    "a tilt needs three new words and a quiet 1.5 s": (
+    "a tilt needs three new words and the previous gesture finished": (
         [(0, Recording(active=True, turn_running=False)),
          (.2, Partial("what is", 1, output=False)),
          (.4, Partial("what is the", 2, output=False)),
          (.6, Partial("what is the tallest mountain", 3, output=False)),
          (1.0, Partial("what is the tallest mountain in", 4, output=False)),
-         (1.9, Partial("what is the tallest mountain in the world", 5, output=False))],
-        [(0, (LISTENING,)), (.2, ()), (.4, (TILT,)), (.6, ()), (1.0, ()), (1.9, (TILT,))]),
+         (1.9, Partial("what is the tallest mountain in the world", 5, output=False)),
+         (2.0, Partial("what is the tallest mountain in the world", 5, output=False))],
+        [(0, (LISTENING,)), (.2, ()), (.4, (TILT,)), (.6, ()), (1.0, ()), (1.9, ()), (2.0, (TILT,))]),
     "a clause end nods at most every 3 s": (
         [(0, Recording(active=True, turn_running=False)),
          (.5, Partial("I went out and", 1, output=False)),
          (2.5, Partial("I went out and it rained so", 2, output=False)),
          (3.6, Partial("I went out and it rained so", 2, output=False)),
-         (4.1, Partial("I went out and it rained so", 2, output=False)),
+         (4.2, Partial("I went out and it rained so", 2, output=False)),
          (6.0, Partial("I went out and it rained so", 2, output=False))],
-        [(0, (LISTENING,)), (.5, (NOD,)), (2.5, (TILT,)), (3.6, ()), (4.1, (NOD,)), (6.0, ())]),
+        [(0, (LISTENING,)), (.5, (NOD,)), (2.5, (TILT,)), (3.6, ()), (4.2, (NOD,)), (6.0, ())]),
     "a comma ends a clause": (
         [(0, Recording(active=True, turn_running=False)),
          (.3, Partial("well,", 1, output=False))],
@@ -119,8 +119,9 @@ LISTENING_GESTURES = {
     "the wake greeting counts as a gesture": (
         [(0, WakeHeard()),
          (1.0, Partial("one two three", 1, output=False)),
-         (1.5, Partial("one two three four", 2, output=False))],
-        [(0, (SetState(State.LISTENING, Expression.HAPPY),)), (1.0, ()), (1.5, (TILT,))]),
+         (1.5, Partial("one two three four", 2, output=False)),
+         (1.6, Partial("one two three four", 2, output=False))],
+        [(0, (SetState(State.LISTENING, Expression.HAPPY),)), (1.0, ()), (1.5, ()), (1.6, (TILT,))]),
     "a new utterance starts its word count over": (
         [(0, Recording(active=True, turn_running=False)),
          (.1, Partial("one two three", 3, output=False)),
@@ -146,6 +147,16 @@ THINKING_MOTION = {
          (.8, UserSpeech(speaking=False, output=False, turn_running=True, turns_waiting=False)),
          (.9, MuseStatus("working", "Searching the web now.", output=False))],
         [(0, (THINKING,)), (.5, ()), (.6, (LISTENING,)), (.7, ()), (.8, (THINKING,)), (.9, (CURIOUS,))]),
+    "every thinking cue keeps the lean Muse's work chose until the next turn": (
+        [(0, TurnStarted(output=False, user_speaking=False)),
+         (.5, MuseStatus("working", "Searching the web now.", output=False)),
+         (1, UserSpeech(speaking=True, output=False, turn_running=True, turns_waiting=False)),
+         (2, UserSpeech(speaking=False, output=False, turn_running=True, turns_waiting=False)),
+         (3, Working(output=False, user_speaking=False)),
+         (4, OutputIdle(user_speaking=False, turn_open=True, wake_open=False)),
+         (5, TurnStarted(output=False, user_speaking=False))],
+        [(0, (THINKING,)), (.5, (CURIOUS,)), (1, (LISTENING,)), (2, (CURIOUS,)), (3, (CURIOUS,)),
+         (4, (CURIOUS,)), (5, (THINKING,))]),
     "a new turn starts the alternation over": (
         [(0, TurnStarted(output=False, user_speaking=False)),
          (.5, MuseStatus("working", "Searching the web now.", output=False)),
@@ -161,24 +172,30 @@ GOT_IT_NODS = {
          (3, AnswerArrived(output=False)),
          (4, TurnStarted(output=False, user_speaking=False)),
          (6, AnswerArrived(output=False))],
-        [(0, (THINKING,)), (2, (GOT_IT,)), (3, ()), (4, (THINKING,)), (6, (GOT_IT,))]),
+        [(0, (THINKING,)), (2, (NOD,)), (3, ()), (4, (THINKING,)), (6, (NOD,))]),
     "an answer during speech is not nodded at later": (
         [(0, TurnStarted(output=False, user_speaking=False)),
          (1, AnswerArrived(output=True)),
          (2, AnswerArrived(output=False))],
         [(0, (THINKING,)), (1, ()), (2, ())]),
-    "a gesture in the last second suppresses the nod": (
+    "a gesture still playing suppresses the nod": (
         [(0, Recording(active=True, turn_running=False)),
          (.1, Partial("one two three", 1, output=False)),
          (.2, TurnStarted(output=False, user_speaking=False)),
          (.9, AnswerArrived(output=False))],
         [(0, (LISTENING,)), (.1, (TILT,)), (.2, (THINKING,)), (.9, ())]),
-    "a gesture over a second ago does not": (
+    "a finished gesture does not": (
         [(0, Recording(active=True, turn_running=False)),
          (.1, Partial("one two three", 1, output=False)),
          (.2, TurnStarted(output=False, user_speaking=False)),
-         (1.1, AnswerArrived(output=False))],
-        [(0, (LISTENING,)), (.1, (TILT,)), (.2, (THINKING,)), (1.1, (GOT_IT,))]),
+         (1.8, AnswerArrived(output=False))],
+        [(0, (LISTENING,)), (.1, (TILT,)), (.2, (THINKING,)), (1.8, (NOD,))]),
+    "the got-it nod leaves the thinking lean in place": (
+        [(0, TurnStarted(output=False, user_speaking=False)),
+         (.5, MuseStatus("working", "Searching the web now.", output=False)),
+         (2, AnswerArrived(output=False)),
+         (3, Working(output=False, user_speaking=False))],
+        [(0, (THINKING,)), (.5, (CURIOUS,)), (2, (NOD,)), (3, (CURIOUS,))]),
     "no nod unless Reachy is thinking": (
         [(0, Started()),
          (1, AnswerArrived(output=False))],

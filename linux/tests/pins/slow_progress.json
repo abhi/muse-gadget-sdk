@@ -13,7 +13,7 @@
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"expression": "curious", "robot": "set_state", "state": "thinking"},
   {"robot": "cue_progress"},
-  {"expression": null, "robot": "set_state", "state": "thinking"},
+  {"expression": "curious", "robot": "set_state", "state": "thinking"},
   {"audio": "progress_tts:Searching the web now.", "robot": "play"},
   {"robot": "clear_audio"},
   {"expression": "happy", "robot": "set_state", "state": "speaking"},

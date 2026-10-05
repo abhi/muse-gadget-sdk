@@ -7,7 +7,7 @@
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"muse": "send_voice", "options": {"output_modality": "voice"}, "session_id": "robot-chat", "wav_bytes": 22444},
-  {"expression": "nod", "robot": "set_state", "state": "thinking"},
+  {"name": "nod", "robot": "gesture"},
   {"message_id": "reply-1", "muse": "stream_tts"},
   {"expression": "surprised", "robot": "set_state", "state": "speaking"},
   {"audio": "mp3:reply-1", "robot": "play"},

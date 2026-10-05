@@ -56,10 +56,10 @@ POSE_LIMITS = {
     "right_antenna": (-90.0, 90.0), "left_antenna": (-90.0, 90.0),
 }
 _MOTION_PERIOD_S = 0.025
-_SPEECH_GESTURE_S = 1.6
-_SPEECH_GESTURE_KEYFRAMES = ((0., 0.), (.25, 1.), (.45, 1.), (.95, -1.),
-                           (1.15, -1.), (_SPEECH_GESTURE_S, 0.))
-_HEAD_GESTURES = ("nod", "shake")
+GESTURE_DURATION_S = 1.6
+_GESTURE_KEYFRAMES = ((0., 0.), (.25, 1.), (.45, 1.), (.95, -1.),
+                      (1.15, -1.), (GESTURE_DURATION_S, 0.))
+HEAD_GESTURES = frozenset({"nod", "shake", "tilt"})
 
 
 def _ease(progress: float) -> float:
@@ -194,9 +194,8 @@ class ReachyController:
         self._last_pose = None
         self._last_antennas = None
         self._last_body_yaw = 0.0
-        self._gesture_epoch = None
-        self._gesture_anchor = None
-        self._gesture_was_active = False
+        self._gesture_name = None
+        self._gesture_started = 0.0
         self.wobbling_available = False
 
     @property
@@ -239,8 +238,7 @@ class ReachyController:
         self._last_pose = None
         self._last_antennas = None
         self._frozen_antennas = None
-        self._gesture_epoch = self._gesture_anchor = None
-        self._gesture_was_active = False
+        self._gesture_name = None
         try:
             self._robot = self._robot_factory(**self._connect_options)
             from musegadget.reachy_speaker_eq import install_speaker_eq
@@ -331,14 +329,29 @@ class ReachyController:
             raise ValueError(f"Unknown conversation state: {state}")
         if expression is not None and expression not in BUILTIN_EXPRESSIONS:
             raise ValueError(f"Unknown reply expression: {expression}")
+        if expression in HEAD_GESTURES:
+            self.gesture(expression)
+            expression = None
         with self._state_lock:
-            if (state != self._state or expression != self._reply_expression or state == "speaking"
-                    or expression in _HEAD_GESTURES or state == expression == "listening"):
+            if self._starts_new_pose(state, expression):
                 self._state_started = time.monotonic()
             self._state = state
             self._reply_expression = expression
             if state != "thinking":
                 self._progress_started = None
+
+    def _starts_new_pose(self, state: str, expression: str | None) -> bool:
+        """Every spoken line and every changed pose restarts the motion clock; a thinking lean does not."""
+        return (state != self._state or state == "speaking"
+                or state != "thinking" and expression != self._reply_expression)
+
+    def gesture(self, name: str) -> None:
+        """Play a head motion independently of the resting pose and its clock."""
+        if name not in HEAD_GESTURES:
+            raise ValueError(f"Unknown head gesture: {name}")
+        with self._state_lock:
+            self._gesture_name = name
+            self._gesture_started = time.monotonic()
 
     def cue_progress(self) -> None:
         """Accent a spoken progress update without changing the thinking rhythm."""
@@ -523,8 +536,9 @@ class ReachyController:
                     state_started = self._state_started
                     elapsed = now - state_started
                     progress_age = None if self._progress_started is None else now - self._progress_started
-                gesture = state in ("speaking", "listening", "thinking") and expression in _HEAD_GESTURES
-                gesture_active = gesture and elapsed < _SPEECH_GESTURE_S
+                    gesture = self._gesture_name
+                    gesture_age = now - self._gesture_started
+                gesture_active = gesture is not None and gesture_age < GESTURE_DURATION_S
                 wants_wobbling = state == "speaking" and not gesture_active
                 if self.wobbling_available and wants_wobbling != wobbling_active:
                     try:
@@ -554,25 +568,16 @@ class ReachyController:
                         request.result = {"ok": False, "error": str(exc)}
                     finally:
                         request.done.set()
-                        self._gesture_epoch = self._gesture_anchor = None
-                        self._gesture_was_active = False
+                        with self._state_lock:
+                            self._gesture_name = None
                         previous_update = time.monotonic()
                         self._stop.wait(_MOTION_PERIOD_S)
                 else:
-                    if gesture and self._gesture_epoch != state_started:
-                        if self._gesture_anchor is None or not self._gesture_was_active:
-                            coordinates = self._pose_parameters(self._last_pose)
-                            self._gesture_anchor = (coordinates["yaw"], coordinates["pitch"])
-                        self._gesture_epoch = state_started
-                    elif not gesture:
-                        self._gesture_epoch = self._gesture_anchor = None
-                    self._gesture_was_active = gesture_active
-                    self._update_face_tracking("idle" if gesture_active else state)
-                    pose, antennas = self._state_pose(
-                        state, elapsed, expression, progress_age=progress_age,
-                        gesture_anchor=self._gesture_anchor)
-                    if not gesture_active:
-                        pose = self._face_pose(pose)
+                    self._update_face_tracking(state)
+                    pose, antennas = self._state_pose(state, elapsed, expression, progress_age=progress_age)
+                    pose = self._face_pose(pose)
+                    if gesture_active:
+                        pose = self._gesture_pose(pose, gesture, gesture_age)
                     quick_cue = ((state == "listening" and expression == "happy" and elapsed < 1.0)
                                  or (gesture_active and state != "speaking"))
                     if quick_cue:
@@ -628,30 +633,27 @@ class ReachyController:
             except Exception:
                 log.exception("Could not park Reachy Mini")
 
-    def _state_pose(self, state: str, now: float, expression: str | None = None,
-                    *, progress_age: float | None = None,
-                    gesture_anchor: tuple[float, float] | None = None):
-        if expression in _HEAD_GESTURES and (state == "speaking" or state in ("listening", "thinking")
-                                             and now < _SPEECH_GESTURE_S):
-            yaw, pitch = gesture_anchor or (0.0, 0.0)
+    def _gesture_pose(self, pose, name: str, age: float):
+        if not 0 <= age < GESTURE_DURATION_S:
+            return pose
+        coordinates = self._pose_parameters(pose)
+        if name == "tilt":
+            coordinates["roll"] += 10 * math.sin(math.pi * age / GESTURE_DURATION_S) ** 2
+        else:
             wave = 0.0
-            for (start, first), (end, last) in zip(
-                    _SPEECH_GESTURE_KEYFRAMES, _SPEECH_GESTURE_KEYFRAMES[1:]):
-                if now <= end:
-                    wave = first + (last - first) * _ease((now - start) / (end - start))
+            for (start, first), (end, last) in zip(_GESTURE_KEYFRAMES, _GESTURE_KEYFRAMES[1:]):
+                if age <= end:
+                    wave = first + (last - first) * _ease((age - start) / (end - start))
                     break
-            if expression == "nod":
-                pitch += 8 * wave
-            else:
-                yaw += 10 * wave
-            yaw = max(-20, min(20, yaw))
-            pitch = max(-12, min(12, pitch))
-            return self._head(yaw=yaw, pitch=pitch), self._np.deg2rad([-10, 10])
+            coordinates["pitch" if name == "nod" else "yaw"] += (8 if name == "nod" else 10) * wave
+        for axis, limit in (("yaw", 20), ("pitch", 12), ("roll", 20)):
+            coordinates[axis] = max(-limit, min(limit, coordinates[axis]))
+        return self._head(**coordinates)
+
+    def _state_pose(self, state: str, now: float, expression: str | None = None,
+                    *, progress_age: float | None = None):
         if state == "listening":
             coordinates, antennas = EXPRESSION_POSES.get(expression, EXPRESSION_POSES["listening"])
-            if expression == "listening":
-                tilt = math.sin(math.pi * min(1.0, max(0.0, now) / _SPEECH_GESTURE_S)) ** 2
-                coordinates = {**coordinates, "roll": 10 * tilt}
             if expression == "happy":
                 greeting = _ease(now / .2) * (1 - _ease((now - .8) / .6))
                 wiggle = math.sin(math.pi * min(1, max(0, now))) * math.sin(4 * math.pi * now)

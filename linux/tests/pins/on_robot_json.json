@@ -11,7 +11,7 @@
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"audio": "tts:Let me explain that.", "robot": "play"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
-  {"expression": "nod", "robot": "set_state", "state": "thinking"},
+  {"name": "nod", "robot": "gesture"},
   {"expression": "curious", "robot": "set_state", "state": "speaking"},
   {"audio": "tts:Sunlight bends inside raindrops.", "robot": "play"},
   {"expression": "happy", "robot": "set_state", "state": "speaking"},
