@@ -197,9 +197,17 @@ With local speech enabled, startup loads the voice model once. Without wake-word
 invocation, it introduces the expression channel to Muse and speaks "Ready to
 talk" with a nod. The loaded worker remains ready for later turns.
 Reachy chooses a short acknowledgment after recognizing your request. Weather,
-lookup, and reasoning requests receive different acknowledgments; greetings and
-unmatched requests skip this extra phrase. The adapter selects these locally
-without an additional model request. Startup caches their audio. Empty
+lookup, and reasoning requests receive different acknowledgments; unmatched
+requests skip this extra phrase. Small talk never gets one in any mode:
+greetings, "how are you", thanks, yes or no, and anything of three words or
+fewer. The acknowledgment is prepared when the request is sent, but it starts
+only if Muse has sent no reply text within one second (`ACK_GRACE_S`), so a
+fast answer is never delayed behind it. An acknowledgment already playing when
+the answer arrives finishes its words; nothing else queued plays before the
+answer. A companion that returns no acknowledgment means silence; only a late,
+failed, or ungrounded one falls back to Reachy's own phrase. The adapter
+selects the on-robot phrases locally without an additional model request.
+Startup caches their audio. Empty
 recognition does not send a message to Muse. A timed wake opens question capture
 without transcribing the wake phrase. Untimed wake results retain the local
 "Yes?" retry cue when recognition cannot confirm the phrase; other empty

@@ -759,7 +759,7 @@ def test_late_answer_is_introduced_with_the_requests_own_words(monkeypatch):
     monkeypatch.setattr(reachy_voice, "LATE_ANSWER_S", .5)
 
     async def muse(session, request):
-        await asyncio.sleep(1)
+        await asyncio.sleep(reachy_voice.ACK_GRACE_S + .5)
         await session.answer(request, "Robots learned to fold laundry. [reachy:happy]")
 
     service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),

@@ -270,8 +270,8 @@ class FailoverNarrator:
     def _on_companion(self) -> bool:
         return self.route.this_turn and self.companion.available and not self.route.narration.resting
 
-    async def _ask(self, call, deadline_s: float, sources: Tuple[str, ...]):
-        """The companion's lines, or None when they are late, failed or ungrounded."""
+    async def _ask(self, call, deadline_s: float, sources: Tuple[str, ...]) -> Optional[Tuple[SpokenLine, ...]]:
+        """The companion's lines, possibly none, or None when they are late, failed or ungrounded."""
         try:
             result = await asyncio.wait_for(call, deadline_s)
         except CapabilityUnavailable as error:
@@ -286,13 +286,14 @@ class FailoverNarrator:
             self.route.narration.fail("narration added facts that are not in the request or reply")
             return None
         self.route.narration.succeed()
-        return result
+        return lines
 
     async def acknowledge(self, request: str) -> Optional[SpokenLine]:
         if self._on_companion:
-            result = await self._ask(self.companion.acknowledge(request), ACK_DEADLINE_S, (request,))
-            if result is not None:
-                return result
+            lines = await self._ask(self.companion.acknowledge(request), ACK_DEADLINE_S, (request,))
+            if lines is not None:
+                # A healthy companion that chose no acknowledgement means silence, not a miss.
+                return lines[0] if lines else None
         return await self.local.acknowledge(request)
 
     def progress(self, request: str, started: float) -> ProgressPlan:
@@ -301,10 +302,10 @@ class FailoverNarrator:
     async def say_progress(self, request: str, status: str,
                            already_said: Tuple[str, ...]) -> Optional[SpokenLine]:
         if self._on_companion:
-            result = await self._ask(self.companion.say_progress(request, status, already_said),
-                                     PROGRESS_DEADLINE_S, (status, request))
-            if result is not None:
-                return result
+            lines = await self._ask(self.companion.say_progress(request, status, already_said),
+                                    PROGRESS_DEADLINE_S, (status, request))
+            if lines:
+                return lines[0]
         return await self.local.say_progress(request, status, already_said)
 
     async def lines(self, request: str, reply: str, style: ReplyStyle, *,

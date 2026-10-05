@@ -10,7 +10,6 @@
   {"muse": "send_chat", "options": {}, "session_id": "robot-chat", "text": "What's the weather tomorrow?"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"audio": "tts:Let me check the weather.", "robot": "play"},
-  {"expression": null, "robot": "set_state", "state": "thinking"},
   {"expression": null, "robot": "set_state", "state": "listening"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"expression": null, "robot": "set_state", "state": "thinking"},

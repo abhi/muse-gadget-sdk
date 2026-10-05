@@ -22,7 +22,7 @@ from musegadget import reachy_expression_plan as plan
 from musegadget.link_client import DeviceDescription, LinkSession, Outcome
 from musegadget.reachy_capabilities import WAKE_CUE, Backends, EndedTurn, Endpoint, Expression, ReplyStyle, SpokenLine
 from musegadget.reachy_expression import transcript_text
-from musegadget.reachy_follow_up import FollowUp, classify_follow_up, request_topic
+from musegadget.reachy_follow_up import FollowUp, classify_follow_up, is_small_talk, request_topic
 from musegadget.reachy_progress import BackendStatus, ProgressPlan, backend_status_from_event
 from musegadget.service import DEFAULT_NOISE_HOST, Service
 from musegadget.speech_playback import PCMPlayer, SpeechPlayback
@@ -34,6 +34,8 @@ REPLY_QUIET_S = 3.0
 # Muse may fold added detail into its answer to the original without a separate reply.
 DETAIL_REPLY_QUIET_S = 30.0
 EMPTY_REPLY_GRACE_S = 1.0
+# An acknowledgement starts only if Muse has sent no reply text this long after dispatch.
+ACK_GRACE_S = 1.0
 ECHO_TAIL_S = 0.35
 PENDING_TURN_LIMIT = 8
 INPUT_OVERFLOW_CUE = "My question queue is full. Please repeat that after I finish."
@@ -534,6 +536,11 @@ class ReplyTracker:
                 break
         return queued
 
+    def has_reply_text(self) -> bool:
+        """Muse has started its answer: words of a reply, not a progress frame."""
+        return any(message["queued"] or (self.style is not ReplyStyle.EXPRESSIVE_JSON and message["text"].strip())
+                   for message in self.messages.values())
+
     def complete(self, now: float, played: bool) -> bool:
         return (played and not self.busy
                 and (not self.unanswered_follow_up_ids or now - self.last_activity >= DETAIL_REPLY_QUIET_S)
@@ -559,8 +566,8 @@ class MuseJob:
     dispatched_at: float = field(default_factory=time.monotonic)
     replies: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=32))
     progress: ProgressPlan | None = None
-    acknowledgement: asyncio.Task | None = None
-    progress_speech: asyncio.Task | None = None
+    aside: asyncio.Task | None = None  # Reachy's own line about the job: its acknowledgement or a progress update
+    aside_audible: bool = False        # an acknowledgement has started playing, so it is not cut off mid-word
     answered: bool = False
     dropped: bool = False          # the user cancelled it; nothing more of it is spoken
     turned_away: bool = False      # Reachy already told the user a further request must wait
@@ -1328,7 +1335,10 @@ class VoiceConversation:
             job = self.job
             try:
                 if job is not None:
-                    await self._settle(job, turn_cancelled=turn_cancelled)
+                    try:
+                        await self._end_asides(job, let_playing_finish=False, turn_cancelled=turn_cancelled)
+                    finally:
+                        job.progress = None
             finally:
                 prepared, self._prepared_speech = self._prepared_speech, {}
                 await asyncio.gather(*(audio.aclose() for audio in prepared.values()), return_exceptions=True)
@@ -1407,8 +1417,9 @@ class VoiceConversation:
         options = {}
         if style is ReplyStyle.MUSE_VOICE:
             options["output_modality"] = "voice"
-        if text is not None and not self._has_output() and not self._playback.user_speaking:
-            job.acknowledgement = asyncio.create_task(self._acknowledge(text, started))
+        if (text is not None and not is_small_talk(text) and not self._has_output()
+                and not self._playback.user_speaking):
+            job.aside = asyncio.create_task(self._acknowledge(job))
         if wav is None:
             ack = await self.session.send_chat(self._voice_context(style) + _SETUP_REQUEST[style],
                                                self.session_id)
@@ -1430,40 +1441,29 @@ class VoiceConversation:
             log.info("Muse accepted a %.1f-second voice turn", max(0, len(wav) - 44) / 32000)
         return job
 
-    async def _finish_progress(self, job: MuseJob, *, cancel: bool = False,
-                               turn_cancelled: bool = False) -> None:
-        if job.progress_speech is not None:
-            task, job.progress_speech = job.progress_speech, None
-            if cancel:
+    async def _end_asides(self, job: MuseJob, *, let_playing_finish: bool, keep_progress: bool = False,
+                          turn_cancelled: bool = False) -> None:
+        """Wait out Reachy's current line about ``job``, cancelling it unless ``let_playing_finish``
+        and it is an acknowledgement already playing.
+
+        Further progress updates stop too, unless ``keep_progress``.
+        """
+        if not keep_progress and job.progress is not None:
+            job.progress.stop()
+        if job.aside is not None:
+            task, job.aside = job.aside, None
+            if not (let_playing_finish and job.aside_audible):
                 task.cancel()
+            job.aside_audible = False
             result, = await asyncio.gather(task, return_exceptions=True)
             if isinstance(result, Exception):
                 from musegadget.reachy_hardware import ReachyHardwareError
                 if isinstance(result, ReachyHardwareError) and not turn_cancelled:
                     raise result
-                log.warning("Spoken progress failed: %s", type(result).__name__)
-
-    async def _stop_progress(self, job: MuseJob, *, turn_cancelled: bool = False) -> None:
-        if job.progress is not None:
-            job.progress.stop()
-        await self._finish_progress(job, cancel=True, turn_cancelled=turn_cancelled)
-
-    async def _settle(self, job: MuseJob, *, turn_cancelled: bool) -> None:
-        """Stop the job's own speech work: progress lines and an unfinished acknowledgement."""
-        try:
-            await self._stop_progress(job, turn_cancelled=turn_cancelled)
-        finally:
-            job.progress = None
-            if job.acknowledgement is not None:
-                job.acknowledgement.cancel()
-                await asyncio.gather(job.acknowledgement, return_exceptions=True)
-                if not turn_cancelled and not job.acknowledgement.cancelled():
-                    job.acknowledgement.result()
+                log.warning("Reachy's own spoken line failed: %s", type(result).__name__)
 
     async def _deliver(self, job: MuseJob) -> TurnOutcome:
         """Relay Muse's progress and answer for ``job`` until Muse is done with it."""
-        if job.acknowledgement is not None:
-            await job.acknowledgement
         tracker = job.tracker
         started = job.started
         request_text = job.request or ""
@@ -1476,11 +1476,11 @@ class VoiceConversation:
                 return TurnOutcome.ACCEPTED
             now = time.monotonic()
             if tracker.task_finished:
-                await self._stop_progress(job)
+                await self._end_asides(job, let_playing_finish=True)
             if tracker.complete(now, job.answered) and job.replies.empty():
                 return TurnOutcome.ACCEPTED
             if not job.answered and job.replies.empty() and tracker.finished_without_text(now):
-                await self._stop_progress(job)
+                await self._end_asides(job, let_playing_finish=True)
                 log.warning("Muse finished without reply text; returning to listening")
                 if self.backends.voice.speaks_text:
                     from musegadget.reachy_hardware import ReachyHardwareError
@@ -1497,22 +1497,22 @@ class VoiceConversation:
             try:
                 reply = await asyncio.wait_for(job.replies.get(), 0.1)
             except asyncio.TimeoutError:
-                if job.progress_speech is not None and job.progress_speech.done():
-                    await self._finish_progress(job)
+                if job.aside is not None and job.aside.done():
+                    await self._end_asides(job, let_playing_finish=True, keep_progress=True)
                 await self._vary_thinking_pose_if_cooled_down()
-                if (self._input_overflow and job.progress_speech is None and self.backends.voice.speaks_text
+                if (self._input_overflow and job.aside is None and self.backends.voice.speaks_text
                         and not self._has_output() and not self._playback.user_speaking):
                     self._input_overflow = False
-                    job.progress_speech = asyncio.create_task(self._speak(
+                    job.aside = asyncio.create_task(self._speak(
                         None, text=INPUT_OVERFLOW_CUE, state="thinking", stream_segment=True))
-                if (job.progress is not None and job.progress_speech is None and not job.answered
+                if (job.progress is not None and job.aside is None and not job.answered
                         and not self._has_output() and not self._playback.user_speaking):
                     progress = job.progress.take(time.monotonic())
                     if progress is not None:
                         log.info("Reachy selected %s progress %.1fs after the voice turn",
                                  progress.source, time.monotonic() - started)
-                        job.progress_speech = asyncio.create_task(
-                            self._say_progress(request_text, progress.text, progress_said))
+                        job.aside = asyncio.create_task(
+                            self._say_progress(job, progress.text, progress_said))
                 if (job.style is ReplyStyle.EXPRESSIVE_JSON and not waiting_for_segment
                         and not self._has_output() and not self._playback.user_speaking):
                     await self._plan(plan.Working(output=False, user_speaking=False))
@@ -1532,7 +1532,7 @@ class VoiceConversation:
                 if message["stream_revised"] or reply.index < message["stream_skip_before"]:
                     self._discard_prepared((reply.message_id, reply.index))
                     continue
-                await self._stop_progress(job)
+                await self._end_asides(job, let_playing_finish=True)
                 def is_current(message=message, reply=reply):
                     return (not job.dropped and not message["stream_revised"]
                             and reply.index >= message["stream_skip_before"])
@@ -1559,7 +1559,7 @@ class VoiceConversation:
                                        prepared_stream=prepared,
                                        is_current=is_current, on_start=mark_spoken)
             else:
-                await self._stop_progress(job)
+                await self._end_asides(job, let_playing_finish=True)
                 if not job.answered and job.request is not None:
                     await self._answer_begins(job)
                 lines = await self.backends.narrator.lines(
@@ -1681,15 +1681,31 @@ class VoiceConversation:
         await self._queue_replies(job.tracker.acknowledge(response, follow_up=True), job)
         log.info("Reachy sent Muse more detail for the running request")
 
-    async def _acknowledge(self, request: str, started: float) -> None:
-        line = await self.backends.narrator.acknowledge(request)
-        if line is not None:
+    async def _acknowledge(self, job: MuseJob) -> None:
+        """Prepare an acknowledgement at once; speak it only if Muse is still silent at the grace deadline."""
+        line = await self.backends.narrator.acknowledge(job.request)
+        if line is None:
+            return
+        prepared = self.backends.voice.prepare(line, self.hardware.output_sample_rate)
+        def audible() -> None:
+            job.aside_audible = True
+        try:
+            await asyncio.sleep(job.dispatched_at + ACK_GRACE_S - time.monotonic())
+            if job.tracker.has_reply_text() or not job.replies.empty():
+                log.info("Reachy skipped its acknowledgement; Muse's answer began within %.1fs", ACK_GRACE_S)
+                return
             log.info("Reachy selected a question acknowledgement %.1fs after the voice turn",
-                     time.monotonic() - started)
-            await self._speak(None, text=line.text, state="thinking", role=line.role)
+                     time.monotonic() - job.started)
+            speech, prepared = prepared, None
+            await self._speak(None, text=line.text, state="thinking", stream_segment=True, role=line.role,
+                              prepared_stream=speech, on_start=audible)
+        finally:
+            if prepared is not None:
+                prepared.cancel()
+                await prepared.aclose()
 
-    async def _say_progress(self, request: str, status: str, already_said: list) -> None:
-        line = await self.backends.narrator.say_progress(request, status, tuple(already_said))
+    async def _say_progress(self, job: MuseJob, status: str, already_said: list) -> None:
+        line = await self.backends.narrator.say_progress(job.request or "", status, tuple(already_said))
         if line is not None:
             already_said.append(line.text)
             await self._speak(None, text=line.text, state="thinking", stream_segment=True,

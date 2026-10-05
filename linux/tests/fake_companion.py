@@ -13,6 +13,7 @@ Scripted hearing, a deterministic tone for speech, an echo narrator, and fault k
 - no_endpoint: never send hear_endpoint, even for a stream the robot closed with finish.
 - port: listen on this port instead of a free one, so a test can start the companion late.
 - ssl: serve wss:// with this server context.
+- acknowledges: False answers every acknowledge request with no lines, as a narrator does for small talk.
 
 `hellos` records every hello token the fake was sent, accepted or not.
 """
@@ -89,6 +90,7 @@ class FakeCompanion:
         no_endpoint: bool = False,
         port: int = 0,
         ssl=None,
+        acknowledges: bool = True,
     ) -> None:
         self.token = token
         self.ops = ops
@@ -107,6 +109,7 @@ class FakeCompanion:
         self.no_endpoint = no_endpoint
         self.port = port
         self.ssl = ssl
+        self.acknowledges = acknowledges
         self.hellos = []
         self.received = []
         self.url = ""
@@ -243,6 +246,8 @@ class _Session:
             self.ws.transport.abort()
 
     def _echo(self, message: Narrate) -> Tuple[NarratedLine, ...]:
+        if message.op is NarrateOp.ACKNOWLEDGE and not self.fake.acknowledges:
+            return ()
         source = {
             NarrateOp.ACKNOWLEDGE: message.request,
             NarrateOp.PROGRESS: message.status,

@@ -10,7 +10,6 @@
   {"muse": "send_chat", "options": {}, "session_id": "robot-chat", "text": "Can you search for the latest robot news?"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"audio": "tts:Let me look that up.", "robot": "play"},
-  {"expression": null, "robot": "set_state", "state": "thinking"},
   {"name": "nod", "robot": "gesture"},
   {"expression": null, "robot": "set_state", "state": "speaking"},
   {"audio": "tts:About the latest robot news:", "robot": "play"},

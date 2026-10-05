@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Licensed under the Apache License, Version 2.0 (the "License").
 
-"""What the user means by speaking while Muse still works on an earlier request.
+"""What the user's words mean for Reachy's own replies: follow-ups while Muse works, and small talk.
 
 Pure, stdlib-only rules: no model decides whether a sentence cancels a request.
 """
@@ -74,3 +74,17 @@ def request_topic(request: str) -> str:
     while start < len(tokens) and tokens[start].replace("’", "'").casefold() in _TOPIC_LEAD:
         start += 1
     return " ".join(tokens[start:][:TOPIC_WORDS] or tokens[:TOPIC_WORDS])
+
+
+SMALL_TALK_WORDS = 3
+_SMALL_TALK = re.compile(
+    r"(?:\s*(?:hi|hello|hey|hey there|good (?:morning|afternoon|evening|night)|muse|reachy|there"
+    r"|how are you(?: doing)?(?: today)?|how's it going|how is it going|what's up|whats up"
+    r"|nice to meet you|thanks|thank you(?: so much| very much)?|you too|i'm (?:fine|good|great|okay|ok)"
+    r"|yes|yeah|yep|no|nope|okay|ok|sure|cool|great|bye|goodbye|see you(?: later)?)\b[\s,.!?]*)+")
+
+
+def is_small_talk(text: str) -> bool:
+    """Greetings, thanks, yes or no, or at most ``SMALL_TALK_WORDS`` words: nothing worth acknowledging."""
+    words = _words(text)
+    return len(words) <= SMALL_TALK_WORDS or _SMALL_TALK.fullmatch(" ".join(words)) is not None

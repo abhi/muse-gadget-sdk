@@ -1711,7 +1711,7 @@ def test_cancelling_request_stops_contextual_acknowledgement_before_listening_re
 
     class LocalRecognition:
         async def transcribe(self, wav):
-            return "What's the weather?"
+            return "What's the weather today?"
 
     async def scenario():
         async def waiting_request(session):
@@ -1748,7 +1748,7 @@ def test_completed_acknowledgement_hardware_failure_propagates_and_restores_capt
 
     class LocalRecognition:
         async def transcribe(self, wav):
-            return "What's the weather?"
+            return "What's the weather today?"
 
     async def scenario():
         acknowledgement_finished = asyncio.Event()
@@ -1795,7 +1795,7 @@ def test_turn_cancellation_preserves_cancellation_after_acknowledgement_hardware
 
     class LocalRecognition:
         async def transcribe(self, wav):
-            return "What's the weather?"
+            return "What's the weather today?"
 
     async def scenario():
         acknowledgement_finished = asyncio.Event()
