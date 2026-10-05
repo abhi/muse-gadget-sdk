@@ -20,6 +20,8 @@ is internal and can change.
   state directory, or None. It raises `ValueError` for a token that
   gadgets.muse.ai could not have issued.
 - `config.PAIRING_FILE` is the file that holds the pairing.
+- `config.STATE_DIR_ENV` and `config.SDK_TOKEN_ENV` hold the names of the two
+  environment variables, `MUSEGADGET_STATE_DIR` and `MUSEGADGET_SDK_TOKEN`.
 
 ## Pairing
 
@@ -38,6 +40,8 @@ is internal and can change.
 
 - `Service` keeps a paired device connected to its Muse. It fetches the
   device's VMs, connects, reconnects with backoff and rotates the device token.
+- `Service(identity, executor, sdk_token=None, display_name=...)` is a
+  dataclass. A subclass can add its own fields.
 - `Service.run()` runs until `Service.stop()` is called.
 - To describe your own device, or to run your own work while it is connected,
   subclass `Service` and override any of these three methods. `Service` calls
@@ -91,8 +95,26 @@ run_command=...)` is one encrypted session with a Muse VM.
   Pass the acknowledgement to `acknowledge()`.
 - It returns `AgentStatus` for public progress, `Reply` each time an answer
   message changes, and `TaskFinished` when Muse's task ends.
-- `complete(now)` says when Muse is done answering.
-- `ReplayScope` drops events from earlier turns.
+  `TurnEvent` is the union of these three types. `AgentStatus` has
+  `activity_code` and `activity_text`. `Reply` has `message_id`, `text`,
+  `streamed`, `done` and `bound`, which is true when the reply is known to
+  answer this request.
+- `complete(now)` says when Muse is done answering. `settled(now)` says when
+  Muse finished the task and no late text arrived.
+- `MuseTurn(session_id=None, *, owns_chat=False, replay_scope=None,
+  ignore_parentless_until=0.0)` follows a request on the chat `session_id`.
+  Set `owns_chat` when the gadget owns that chat.
+- `replies` maps each answer's message ID to its latest `Reply`.
+  `abandon_reply(message_id)` stops waiting for one reply.
+- `acknowledge(response, follow_up=True)` binds one more user message to the
+  request. Call `expect_follow_up()` before you send it.
+- `acknowledged`, `busy`, `task_finished`, `activity_code` and
+  `last_activity` describe the request's state.
+- `ReplayScope` drops events from earlier turns. Share one across the turns
+  of a chat the gadget owns. `retire()` on a finished turn adds its IDs.
+  `ReplayScope.retire_request(response)` retires a request that no turn
+  follows. `ReplayScope.observe_idle(event, session_id)` retires an event
+  seen while no turn is open.
 
 ## The Reachy Mini contract
 
@@ -104,14 +126,24 @@ standard library.
 - `reachy.commands.parse_command(name, params, *, antenna_mode, timeout_ms)`
   checks one call and returns a `Command` with the defaults filled in. It
   raises `ValueError` that names the first problem.
+- `reachy.commands.POSE_LIMITS` maps each pose and antenna parameter to its
+  `(low, high)` range in millimetres or degrees.
 - `reachy.expressions.Expression` lists the expressions that Muse can name in
   a reply. `Expression.parse(name)` returns None for an unknown name.
 - `reachy.prompts.voice_context(style, ...)` describes Reachy and the reply
   format to Muse. It also records whether motion, each antenna and face
   tracking are on.
-- `reachy.prompts` also holds every other text Reachy sends Muse: the setup
-  text for Reachy's side chat and for each reply style, the stop request, and
-  the text that introduces a spoken request.
+- `reachy.prompts.SETUP_REQUEST` maps each `ReplyStyle` to the text that asks
+  Muse to start answering in that style.
+- `reachy.prompts.CHAT_SETUP_PREFIX` and `reachy.prompts.CHAT_SETUP_SUFFIX` go
+  before and after a voice context to make the setup message for Reachy's side
+  chat. `reachy.prompts.CHAT_SETUP_MESSAGE` is the two with no context between.
+- `reachy.prompts.with_setup_challenge(setup_message, nonce)` appends the
+  setup challenge to a setup message. Muse answers it with exactly
+  `reachy.prompts.setup_challenge_reply(nonce)`.
+- `reachy.prompts.STOP_REQUEST` asks Muse to stop working on the last request.
+- `reachy.prompts.spoken_request(context, text)` puts a voice context before a
+  spoken request, for a chat that last heard another reply style.
 - `reachy.replies.ReplyStyle` names the reply formats.
 - `reachy.replies.spoken_reply(text)` splits a reply into speech and the
   expression from its last `[reachy:NAME]` marker.
