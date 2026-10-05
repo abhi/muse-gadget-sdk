@@ -42,7 +42,7 @@ reachy-stt-streaming = ["sherpa-onnx==1.13.8"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-musegadget = ["data/*", "data/face_tracking/*"]
+musegadget = ["data/*", "data/face_tracking/*", "data/companion_protocol_v1/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
