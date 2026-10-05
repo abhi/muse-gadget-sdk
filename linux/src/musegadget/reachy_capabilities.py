@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, AsyncIterator, Iterable, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, AsyncIterator, Optional, Protocol, Tuple
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -16,6 +16,9 @@ if TYPE_CHECKING:
     from musegadget.reachy_progress import ProgressPlan
 
     SpeechRole = Literal["ack", "progress", "answer", "notice"]
+
+
+WAKE_CUE = "Yes?"
 
 
 class Expression(str, Enum):
@@ -39,11 +42,14 @@ class Expression(str, Enum):
 
 
 class ReplyStyle(Enum):
-    """The Muse prompt a request was sent with, which also picks its reply parser."""
+    MUSE_VOICE = "muse_voice"
+    MARKER = "marker"
+    EXPRESSIVE_JSON = "json"
 
-    MUSE_VOICE = "muse_voice"      # Muse speaks; a trailing [reachy:NAME] picks the expression
-    MARKER = "marker"              # local speech of a reply with a trailing [reachy:NAME]
-    EXPRESSIVE_JSON = "json"       # local speech of one JSON sentence frame per line
+
+class Mode(Enum):
+    MUSE_VOICE = "muse-voice"
+    ON_ROBOT = "on-robot"
 
 
 @dataclass(frozen=True)
@@ -112,16 +118,12 @@ class PreparedVoice(Protocol):
 class Voice(Protocol):
     speaks_text: bool              # False: speaks only Muse's own audio for a Muse message
 
+    async def warm(self, output_rate: int) -> None: ...
     def stream(self, line: SpokenLine, output_rate: int) -> AsyncIterator[np.ndarray]: ...
     def prepare(self, line: SpokenLine, output_rate: int) -> Optional[PreparedVoice]: ...
-    async def cache(self, phrases: Iterable[str], output_rate: int) -> None: ...
-    def cached(self, text: str) -> Optional[Tuple[np.ndarray, ...]]: ...
 
 
 class Narrator(Protocol):
-    acknowledgements: Tuple[str, ...]
-    progress_phrases: Tuple[str, ...]
-
     async def acknowledge(self, request: str) -> Optional[SpokenLine]: ...
     def progress(self, request: str, started: float) -> ProgressPlan: ...
     def lines(self, reply: str, style: ReplyStyle, *,
@@ -135,9 +137,3 @@ class Backends:
     narrator: Narrator
     reply_style: ReplyStyle
     progress_voice: Optional[Voice] = None
-
-    def __post_init__(self) -> None:
-        if not self.voice.speaks_text and self.reply_style is not ReplyStyle.MUSE_VOICE:
-            raise ValueError("a text reply style requires local speech")
-        if self.voice.speaks_text and self.reply_style is ReplyStyle.MUSE_VOICE:
-            raise ValueError("Muse voice replies require Muse speech")

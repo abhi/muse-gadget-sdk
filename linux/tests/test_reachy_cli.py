@@ -630,15 +630,6 @@ def test_pair_uses_explicit_state_and_existing_cli(tmp_path, monkeypatch):
     assert captured == {'state': tmp_path, 'force': False, 'timeout': 90}
 
 
-def test_streaming_requires_local_speech_before_starting_hardware(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv(config.SDK_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(config, 'load_json', lambda *args: {'paired': True})
-    monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: (_ for _ in ()).throw(
-        AssertionError('hardware started with unusable streaming configuration')))
-    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--stream-replies']) == 1
-    assert '--stream-replies requires --tts-model' in capsys.readouterr().err
-
-
 def test_streaming_option_reaches_the_conversation_service(tmp_path, monkeypatch):
     from musegadget.identity import Identity
 
@@ -680,25 +671,19 @@ def test_streaming_option_reaches_the_conversation_service(tmp_path, monkeypatch
     monkeypatch.setattr(reachy_cli.identity, 'load_or_create', lambda: Identity('02:00:00:ab:cd:ef'))
     monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: Hardware())
     monkeypatch.setattr('musegadget.local_speech.PiperSpeech', lambda model: next(speech_backends))
+    monkeypatch.setattr('musegadget.speech_gate.SileroSpeechGate', object)
+    monkeypatch.setattr('musegadget.local_transcription.WhisperTranscriber', lambda model: Speech('transcriber'))
     monkeypatch.setattr('musegadget.reachy_voice.ReachyService', Service)
-    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--tts-model',
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--mode', 'on-robot',
+                           '--stt-model', str(tmp_path / 'whisper'), '--tts-model',
                            str(tmp_path / 'voice.onnx'), '--stream-replies']) == 0
     backends = captured['backends'](object())
     assert backends.reply_style is ReplyStyle.EXPRESSIVE_JSON
     assert backends.voice.speech is speech
     assert backends.progress_voice.speech is progress_speech
-    assert calls == ['hardware started', 'speech started', 'progress speech started', 'service ran',
-                     'hardware closed', 'speech closed', 'progress speech closed']
-
-
-def test_wake_invocation_requires_local_transcription_before_hardware(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv(config.SDK_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(config, 'load_json', lambda *args: {'paired': True})
-    monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: (_ for _ in ()).throw(
-        AssertionError('hardware started without local transcription for wake mode')))
-    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--wake-model',
-                           str(tmp_path / 'wake')]) == 1
-    assert '--wake-model requires --stt-model' in capsys.readouterr().err
+    assert calls == ['hardware started', 'speech started', 'progress speech started', 'transcriber started',
+                     'service ran', 'hardware closed', 'speech closed', 'progress speech closed',
+                     'transcriber closed']
 
 
 @pytest.mark.parametrize('timeout', ['0', '-1', '301', 'nan', 'inf'])
@@ -709,16 +694,6 @@ def test_invalid_wake_timeout_is_rejected_before_hardware(tmp_path, monkeypatch,
         AssertionError('hardware started with an invalid wake timeout')))
     assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--wake-timeout', timeout]) == 1
     assert '--wake-timeout must be between 1 and 300 seconds' in capsys.readouterr().err
-
-
-def test_wake_invocation_requires_local_speech_before_hardware(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv(config.SDK_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(config, 'load_json', lambda *args: {'paired': True})
-    monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: (_ for _ in ()).throw(
-        AssertionError('hardware started without local speech for wake mode')))
-    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--wake-model',
-                           str(tmp_path / 'wake'), '--stt-model', str(tmp_path / 'whisper')]) == 1
-    assert '--wake-model requires --tts-model' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('backend', [None, 'sherpa', 'vosk'])
@@ -795,7 +770,7 @@ def test_wake_model_phrase_and_idle_timeout_reach_the_service(tmp_path, monkeypa
     caplog.set_level('INFO', logger='musegadget.reachy_cli')
     model = tmp_path / 'keywords'
     backend_args = ['--wake-backend', backend] if backend is not None else []
-    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--stt-model',
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--mode', 'on-robot', '--stt-model',
                            str(tmp_path / 'whisper'), '--wake-model', str(model),
                            '--tts-model', str(tmp_path / 'voice.onnx'),
                            '--wake-phrase', 'hey muse', '--wake-timeout', '10',
@@ -818,16 +793,6 @@ def test_vosk_backend_requires_a_model_before_hardware(tmp_path, monkeypatch, ca
         AssertionError('hardware started without a Vosk model')))
     assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--wake-backend', 'vosk']) == 1
     assert '--wake-backend vosk requires --wake-model' in capsys.readouterr().err
-
-
-@pytest.mark.parametrize('stt_backend', ['moonshine', 'sherpa-streaming'])
-def test_nondefault_transcription_requires_a_model_before_hardware(tmp_path, monkeypatch, capsys, stt_backend):
-    monkeypatch.delenv(config.SDK_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(config, 'load_json', lambda *args: {'paired': True})
-    monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: (_ for _ in ()).throw(
-        AssertionError('hardware started without a transcription model')))
-    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--stt-backend', stt_backend]) == 1
-    assert f'--stt-backend {stt_backend} requires --stt-model' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('operation, failed_resource', [
@@ -910,7 +875,7 @@ def test_startup_and_cleanup_failures_attempt_all_resource_cleanup(
     monkeypatch.setitem(sys.modules, 'musegadget.wake_word', SimpleNamespace(
         WakeWordDetector=lambda model, phrase: detector))
     monkeypatch.setattr('musegadget.reachy_voice.ReachyService', Service)
-    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run',
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--mode', 'on-robot',
                            '--tts-model', str(tmp_path / 'voice.onnx'),
                            '--stt-model', str(tmp_path / 'whisper'),
                            '--wake-model', str(tmp_path / 'wake'), '--stt-backend', stt_backend]) == 1
@@ -946,8 +911,85 @@ def test_missing_speech_gate_stops_before_capture_and_closes_prepared_resources(
     monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: Hardware())
     monkeypatch.setattr('musegadget.local_speech.PiperSpeech', lambda model: Speech())
     monkeypatch.setattr('musegadget.speech_gate.SileroSpeechGate', missing_gate)
-    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run',
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--mode', 'on-robot',
                            '--tts-model', str(tmp_path / 'voice.onnx'),
                            '--stt-model', str(tmp_path / 'whisper')]) == 1
     assert 'Silero VAD asset is missing' in capsys.readouterr().err
     assert closed == ['hardware', 'speech', 'speech']
+
+
+@pytest.mark.parametrize('argv, errors', [
+    (['--stt-model', 'whisper'], ['--stt-model needs --mode on-robot']),
+    (['--stt-model', 'whisper', '--tts-model', 'voice.onnx'],
+     ['--stt-model needs --mode on-robot', '--tts-model needs --mode on-robot']),
+    (['--mode', 'muse-voice', '--tts-model', 'voice.onnx', '--stream-replies'],
+     ['--tts-model needs --mode on-robot', '--stream-replies needs --mode on-robot']),
+    (['--stt-backend', 'moonshine'], ['--stt-backend needs --mode on-robot']),
+    (['--wake-model', 'keywords'], ['--wake-model needs --mode on-robot']),
+    (['--mode', 'on-robot'], ['--mode on-robot needs --stt-model', '--mode on-robot needs --tts-model']),
+    (['--mode', 'on-robot', '--stt-model', 'whisper', '--wake-model', 'keywords'],
+     ['--mode on-robot needs --tts-model']),
+])
+def test_each_mode_rejects_missing_and_foreign_flags_before_anything_starts(
+        tmp_path, monkeypatch, capsys, argv, errors):
+    monkeypatch.setattr(config, 'load_json', lambda *args: pytest.fail('pairing read with invalid flags'))
+    monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: pytest.fail('hardware started with invalid flags'))
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', *argv]) == 2
+    assert capsys.readouterr().err == ''.join(f'Reachy: {error}\n' for error in errors)
+
+
+def test_companion_mode_is_not_offered_yet(capsys):
+    with pytest.raises(SystemExit) as raised:
+        reachy_cli.main(['run', '--mode', 'companion'])
+    assert raised.value.code == 2
+    assert "argument --mode: invalid choice: 'companion'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('argv, style, voice', [
+    ([], ReplyStyle.MUSE_VOICE, 'MuseVoice'),
+    (['--mode', 'muse-voice'], ReplyStyle.MUSE_VOICE, 'MuseVoice'),
+    (['--mode', 'on-robot', '--stt-model', 'whisper', '--tts-model', 'voice.onnx'],
+     ReplyStyle.MARKER, 'LocalVoice'),
+    (['--mode', 'on-robot', '--stt-model', 'whisper', '--tts-model', 'voice.onnx', '--stream-replies'],
+     ReplyStyle.EXPRESSIVE_JSON, 'LocalVoice'),
+])
+def test_each_mode_starts_the_conversation_with_its_reply_style_and_voice(tmp_path, monkeypatch, argv, style, voice):
+    from musegadget.identity import Identity
+
+    captured = {}
+
+    class Hardware:
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Model:
+        async def start(self):
+            pass
+
+        async def close(self):
+            pass
+
+    class Service:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def stop(self):
+            pass
+
+        async def run(self):
+            pass
+
+    monkeypatch.delenv(config.SDK_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(config, 'load_json', lambda *args: {'paired': True})
+    monkeypatch.setattr(reachy_cli.identity, 'load_or_create', lambda: Identity('02:00:00:ab:cd:ef'))
+    monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: Hardware())
+    monkeypatch.setattr('musegadget.local_speech.PiperSpeech', lambda model: Model())
+    monkeypatch.setattr('musegadget.local_transcription.WhisperTranscriber', lambda model: Model())
+    monkeypatch.setattr('musegadget.speech_gate.SileroSpeechGate', object)
+    monkeypatch.setattr('musegadget.reachy_voice.ReachyService', Service)
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', *argv]) == 0
+    backends = captured['backends'](object())
+    assert (backends.reply_style, type(backends.voice).__name__) == (style, voice)

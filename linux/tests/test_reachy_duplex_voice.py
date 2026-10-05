@@ -8,8 +8,8 @@ import wave
 import pytest
 
 from musegadget import reachy_voice, voice_audio
-from musegadget.reachy_capabilities import ReplyStyle
-from musegadget.reachy_local_backends import LocalHearing, robot_backends
+from musegadget.reachy_capabilities import Mode, ReplyStyle
+from musegadget.reachy_local_backends import LocalHearing, backends_for
 from musegadget.reachy_voice import TurnOutcome, VoiceConversation
 from musegadget.wake_word import WakeDetection
 from test_reachy_voice import FakeHardware, FakeSession, bounded, cancel_task, chat_event, sentence_frame
@@ -123,8 +123,10 @@ def duplex(monkeypatch):
                 return "Question one."
 
         options = {} if silence_s is None else {"silence_s": silence_s}
-        backends = robot_backends(session, speech=speech or (object() if wake else None),
-                                  transcriber=transcriber or Recognition())
+        backends = (backends_for(Mode.ON_ROBOT, session, speech=speech or object(),
+                                 transcriber=transcriber or Recognition())
+                    if speech is not None or wake or transcriber is not None or hold_recognition
+                    else backends_for(Mode.MUSE_VOICE, session))
         if owned:
             options.update(session_id="robot-chat", owns_chat=True)
             session.acknowledgement["response"]["result"].update(session_id="robot-chat", is_thread=True)
@@ -358,7 +360,7 @@ def test_next_question_is_captured_while_first_question_is_still_transcribing(du
         finally:
             await cancel_task(subscriber)
 
-    asyncio.run(bounded(duplex(run, echo=False, real_turn=True, hold_recognition=True)))
+    asyncio.run(bounded(duplex(run, echo=False, real_turn=True, hold_recognition=True, owned=True)))
 
 
 def test_capture_gap_drops_partial_words_but_keeps_already_queued_requests(duplex):

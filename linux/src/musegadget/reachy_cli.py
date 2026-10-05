@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import functools
 import hashlib
 import json
@@ -21,6 +22,7 @@ import time
 import uuid
 
 from musegadget import config, identity
+from musegadget.reachy_capabilities import Mode
 
 
 CHAT_STATE_FILE = "reachy-chat.json"
@@ -273,6 +275,34 @@ class ReachySideChat:
             await subscription.aclose()
 
 
+@dataclass(frozen=True)
+class ModeFlags:
+    requires: tuple[str, ...] = ()
+    forbids: tuple[str, ...] = ()
+
+
+MODE_FLAGS = {
+    Mode.MUSE_VOICE: ModeFlags(forbids=("--stt-model", "--stt-backend", "--tts-model",
+                                        "--stream-replies", "--wake-model")),
+    Mode.ON_ROBOT: ModeFlags(requires=("--stt-model", "--tts-model")),
+}
+
+
+def mode_problems(args) -> list[str]:
+    def given(flag):
+        return getattr(args, flag[2:].replace("-", "_")) not in (None, False)
+
+    mode = Mode(args.mode)
+    rule = MODE_FLAGS[mode]
+    problems = [f"--mode {mode.value} needs {flag}" for flag in rule.requires if not given(flag)]
+    for flag in rule.forbids:
+        if given(flag):
+            allowed = " or ".join(other.value for other, flags in MODE_FLAGS.items()
+                                  if flag not in flags.forbids)
+            problems.append(f"{flag} needs --mode {allowed}")
+    return problems
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Talk to Muse through Reachy Mini")
     p.add_argument("--state-dir", type=Path,
@@ -295,6 +325,10 @@ def parser() -> argparse.ArgumentParser:
         item.add_argument("--antenna-mode", choices=("both", "left", "right", "none"), default="both",
                           help="Antennas to animate; other antenna targets stay at their measured startup positions")
         if command == "run":
+            item.add_argument("--mode", choices=tuple(mode.value for mode in MODE_FLAGS),
+                              default=Mode.MUSE_VOICE.value,
+                              help="muse-voice: Muse hears and speaks (default). "
+                                   "on-robot: Reachy's own speech models; needs --stt-model and --tts-model")
             item.add_argument("--face-follow", action="store_true",
                               help="Follow a nearby face locally during conversations; camera frames stay on the robot")
             item.add_argument("--face-follow-model", type=Path,
@@ -302,11 +336,11 @@ def parser() -> argparse.ArgumentParser:
             item.add_argument("--stt-model", type=Path,
                               help="Local model directory for the selected speech recognition backend")
             item.add_argument("--stt-backend", choices=("whisper", "moonshine", "sherpa-streaming"),
-                              default="whisper", help="Local speech recognizer (default: whisper)")
+                              help="Local speech recognizer; whisper when omitted")
             item.add_argument("--tts-model", type=Path,
                               help="Piper ONNX model for speaking normal Muse answers locally")
             item.add_argument("--stream-replies", action="store_true",
-                              help="Speak incoming Muse chunks with per-chunk expressions; requires --tts-model")
+                              help="Speak incoming Muse chunks with per-chunk expressions")
             item.add_argument("--audio-diagnostics", action="store_true",
                               help="Log playback timing counters without audio or transcript content")
             item.add_argument("--wake-model", type=Path,
@@ -341,7 +375,7 @@ def _hardware(args, *, motion=True):
 
 
 async def run(args) -> int:
-    from musegadget.reachy_local_backends import robot_backends
+    from musegadget.reachy_local_backends import backends_for
     from musegadget.reachy_voice import ReachyService
 
     if not config.load_json(config.PAIRING_FILE):
@@ -356,16 +390,8 @@ async def run(args) -> int:
         raise ValueError("--face-follow requires motion to be enabled")
     if not 0.3 <= args.silence <= 3:
         raise ValueError("--silence must be between 0.3 and 3 seconds")
-    if args.stream_replies and args.tts_model is None:
-        raise ValueError("--stream-replies requires --tts-model")
-    if args.stt_backend != "whisper" and args.stt_model is None:
-        raise ValueError(f"--stt-backend {args.stt_backend} requires --stt-model")
     if args.wake_backend == "vosk" and args.wake_model is None:
         raise ValueError("--wake-backend vosk requires --wake-model")
-    if args.wake_model is not None and args.stt_model is None:
-        raise ValueError("--wake-model requires --stt-model")
-    if args.wake_model is not None and args.tts_model is None:
-        raise ValueError("--wake-model requires --tts-model")
     if not math.isfinite(args.wake_timeout) or not 1 <= args.wake_timeout <= 300:
         raise ValueError("--wake-timeout must be between 1 and 300 seconds")
     ident = identity.load_or_create()
@@ -421,10 +447,11 @@ async def run(args) -> int:
                                prepare_chat=dedicated_chat.prepare if dedicated_chat else None,
                                owns_chat=dedicated_chat is not None,
                                silence_s=args.silence,
-                               backends=functools.partial(robot_backends, speech=speech,
+                               backends=functools.partial(backends_for, Mode(args.mode), speech=speech,
                                                           progress_speech=progress_speech,
                                                           transcriber=transcriber,
-                                                          stream_replies=args.stream_replies),
+                                                          stream_replies=args.stream_replies,
+                                                          wake=wake_detector is not None),
                                audio_diagnostics=args.audio_diagnostics, wake_detector=wake_detector,
                                wake_timeout_s=args.wake_timeout, speech_gate=speech_gate)
         loop = asyncio.get_running_loop()
@@ -517,6 +544,11 @@ def doctor(args) -> int:
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    problems = mode_problems(args) if args.command == "run" else []
+    for problem in problems:
+        print(f"Reachy: {problem}", file=sys.stderr)
+    if problems:
+        return 2
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # Third-party debug logs may include bearer headers or conversation text.

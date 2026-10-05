@@ -7,10 +7,10 @@ import asyncio
 import logging
 import re
 import time
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from musegadget.reachy_capabilities import (
-    Backends, Endpoint, Expression, HeardAudio, ReplyStyle, SpokenLine,
+    WAKE_CUE, Backends, Endpoint, Expression, HeardAudio, Mode, ReplyStyle, SpokenLine,
 )
 from musegadget.reachy_expression import spoken_reply
 from musegadget.reachy_progress import PUBLIC_PROGRESS_PHRASES, ProgressPlan
@@ -171,25 +171,36 @@ class LocalHearing:
         return Endpoint(wav, text)
 
 
-class LocalVoice:
-    """A local speech engine such as Piper, with fixed phrases synthesized in advance."""
+class _Replay:
+    def __init__(self, chunks):
+        self._chunks = iter(chunks)
 
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    def cancel(self) -> None:
+        self._chunks = iter(())
+
+    async def aclose(self) -> None:
+        self.cancel()
+
+
+class LocalVoice:
     speaks_text = True
 
-    def __init__(self, speech):
+    def __init__(self, speech, fixed_phrases: Tuple[str, ...] = ()):
         self.speech = speech
+        self.fixed_phrases = fixed_phrases
         self.phrases = {}
 
-    def stream(self, line: SpokenLine, output_rate: int):
-        return self.speech.stream(line.text, output_rate)
-
-    def prepare(self, line: SpokenLine, output_rate: int):
-        if not callable(getattr(self.speech, "prepare", None)):
-            return None
-        return self.speech.prepare(line.text, output_rate)
-
-    async def cache(self, phrases, output_rate: int) -> None:
-        for phrase in phrases:
+    async def warm(self, output_rate: int) -> None:
+        for phrase in self.fixed_phrases:
             stream = self.speech.stream(phrase, output_rate)
             audio = []
             try:
@@ -199,8 +210,20 @@ class LocalVoice:
                 await stream.aclose()
             self.phrases[phrase] = tuple(audio)
 
-    def cached(self, text: str):
-        return self.phrases.get(text)
+    def is_presynthesized(self, text: str) -> bool:
+        return bool(self.phrases.get(text))
+
+    def stream(self, line: SpokenLine, output_rate: int):
+        if self.is_presynthesized(line.text):
+            return _Replay(self.phrases[line.text])
+        return self.speech.stream(line.text, output_rate)
+
+    def prepare(self, line: SpokenLine, output_rate: int):
+        if self.is_presynthesized(line.text):
+            return _Replay(self.phrases[line.text])
+        if not callable(getattr(self.speech, "prepare", None)):
+            return None
+        return self.speech.prepare(line.text, output_rate)
 
 
 class MuseVoice:
@@ -226,27 +249,22 @@ class MuseVoice:
                 yield samples
         return decoded()
 
-    def prepare(self, line: SpokenLine, output_rate: int):
-        return None
-
-    async def cache(self, phrases, output_rate: int) -> None:
+    async def warm(self, output_rate: int) -> None:
         pass
 
-    def cached(self, text: str):
+    def prepare(self, line: SpokenLine, output_rate: int):
         return None
 
 
 class RuleNarrator:
-    """Fixed acknowledgement and progress phrases, and Muse's reply as spoken lines."""
-
-    progress_phrases = PUBLIC_PROGRESS_PHRASES
-
-    def __init__(self, *, acknowledge: bool = False):
-        self.acknowledgements = ACKNOWLEDGEMENTS if acknowledge else ()
+    def __init__(self, *, presynthesized: Optional[Callable[[str], bool]] = None):
+        self._presynthesized = presynthesized
 
     async def acknowledge(self, request: str) -> Optional[SpokenLine]:
         phrase = contextual_acknowledgement(request)
-        return SpokenLine(phrase, None, "ack") if phrase in self.acknowledgements else None
+        if phrase is None or self._presynthesized is None or not self._presynthesized(phrase):
+            return None
+        return SpokenLine(phrase, None, "ack")
 
     def progress(self, request: str, started: float) -> ProgressPlan:
         return ProgressPlan(request, started)
@@ -259,15 +277,17 @@ class RuleNarrator:
         return (SpokenLine(text, Expression.parse(expression), "answer", message_id),)
 
 
-def robot_backends(session, *, speech=None, progress_speech=None, transcriber=None,
-                   stream_replies: bool = False) -> Backends:
-    """One conversation's parts from the robot's installed speech models."""
-    style = (ReplyStyle.EXPRESSIVE_JSON if stream_replies else
-             ReplyStyle.MUSE_VOICE if speech is None else ReplyStyle.MARKER)
+def backends_for(mode: Mode, session, *, speech=None, progress_speech=None, transcriber=None,
+                 stream_replies: bool = False, wake: bool = False) -> Backends:
+    if mode is Mode.MUSE_VOICE:
+        return Backends(hearing=LocalHearing(), voice=MuseVoice(session), narrator=RuleNarrator(),
+                        reply_style=ReplyStyle.MUSE_VOICE)
+    voice = LocalVoice(speech, (*ACKNOWLEDGEMENTS, *((WAKE_CUE,) if wake else ())))
     return Backends(
         hearing=LocalHearing(transcriber),
-        voice=MuseVoice(session) if speech is None else LocalVoice(speech),
-        narrator=RuleNarrator(acknowledge=speech is not None and transcriber is not None),
-        reply_style=style,
-        progress_voice=None if progress_speech is None else LocalVoice(progress_speech),
+        voice=voice,
+        narrator=RuleNarrator(presynthesized=voice.is_presynthesized),
+        reply_style=ReplyStyle.EXPRESSIVE_JSON if stream_replies else ReplyStyle.MARKER,
+        progress_voice=(None if progress_speech is None
+                        else LocalVoice(progress_speech, PUBLIC_PROGRESS_PHRASES)),
     )

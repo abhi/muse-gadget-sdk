@@ -9,7 +9,8 @@ import pytest
 from musegadget import reachy_voice
 from musegadget.identity import Identity
 from musegadget.link_client import Outcome
-from musegadget.reachy_local_backends import robot_backends
+from musegadget.reachy_capabilities import Mode
+from musegadget.reachy_local_backends import backends_for
 from test_reachy_voice import FakeHardware, FakeSession, chat_event, mp3_tone, sentence_frame  # noqa: F401
 
 np = pytest.importorskip("numpy")
@@ -211,8 +212,10 @@ class Rig:
 
         async def prepare_chat(session, vm):
             return "robot-chat"
-        backends = functools.partial(robot_backends, speech=speech, progress_speech=progress_speech,
-                                     transcriber=transcriber, stream_replies=stream_replies)
+        mode = Mode.MUSE_VOICE if speech is None else Mode.ON_ROBOT
+        backends = functools.partial(backends_for, mode, speech=speech, progress_speech=progress_speech,
+                                     transcriber=transcriber, stream_replies=stream_replies,
+                                     wake="wake_detector" in fields)
         return reachy_voice.ReachyService(
             identity=Identity("02:00:00:ab:cd:ef"), executor=self.hardware, silence_s=.2,
             speech_gate=Vad(), backends=backends,

@@ -73,12 +73,27 @@ sudo ~/muse-reachy-venv/bin/muse-reachy \
 sudo chown -R pollen:pollen /home/pollen/.local/share/musegadget-reachy
 ```
 
+## Choose a mode
+
+`muse-reachy run --mode` decides who hears you and who speaks.
+
+- `muse-voice` is the default. Reachy records your turn and sends the audio to
+  Muse. Muse writes the answer and speaks it. The robot needs no speech models.
+  The tested Muse VM does not answer reliably this way yet; see
+  [Muse response compatibility](#muse-response-compatibility).
+- `on-robot` keeps speech on the robot. Whisper turns your words into text, and
+  Piper speaks Muse's answer. This mode needs `--stt-model` and `--tts-model`.
+  `--stream-replies` and wake-word invocation work only in this mode.
+
+Reachy checks the flags before it starts. A flag that does not fit the mode
+stops startup with a message such as `--stt-model needs --mode on-robot`.
+
 ## Check and start
 
 ```sh
 ~/muse-reachy-venv/bin/muse-reachy doctor
 ~/muse-reachy-venv/bin/muse-reachy doctor --exercise
-~/muse-reachy-venv/bin/muse-reachy run --stream-replies --tts-model \
+~/muse-reachy-venv/bin/muse-reachy run --mode on-robot --stream-replies --tts-model \
   ~/.local/share/musegadget-reachy/voices/en_US-lessac-medium.onnx --stt-model \
   ~/.local/share/musegadget-reachy/whisper-tiny.en
 ```
@@ -260,7 +275,7 @@ mkdir -p ~/.local/share/musegadget-reachy
 curl -fL https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2 \
   -o /tmp/muse-reachy-keywords.tar.bz2
 tar -xjf /tmp/muse-reachy-keywords.tar.bz2 -C ~/.local/share/musegadget-reachy
-~/muse-reachy-venv/bin/muse-reachy run --stream-replies \
+~/muse-reachy-venv/bin/muse-reachy run --mode on-robot --stream-replies \
   --wake-model ~/.local/share/musegadget-reachy/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 \
   --wake-phrase 'hey muse' --wake-timeout 10 \
   --tts-model ~/.local/share/musegadget-reachy/voices/en_US-lessac-medium.onnx \
@@ -272,7 +287,7 @@ The detector uses the int8 encoder, decoder, and joiner, plus `tokens.txt` and
 tokenizes the configured phrase locally. The keyword threshold is 0.25, with
 keyword score 1.0 and four decoder paths. Installed wheels must support the
 device's Python version and architecture.
-Wake-word mode requires `--stt-model` and `--tts-model`. Startup remains quiet.
+Wake-word invocation needs `--mode on-robot`. Startup remains quiet.
 The dedicated chat receives expression instructions during initialization;
 later user messages contain only the recognized request. Explicit main-chat or
 existing-chat modes retain their initial instruction prefix.
@@ -290,7 +305,7 @@ into `~/.local/share/musegadget-reachy/wake-vosk-en-us`, with `am`, `conf`, and
 `graph` directly inside that directory. Use the existing Piper and Whisper models:
 
 ```sh
-~/muse-reachy-venv/bin/muse-reachy run --stream-replies \
+~/muse-reachy-venv/bin/muse-reachy run --mode on-robot --stream-replies \
   --wake-backend vosk \
   --wake-model ~/.local/share/musegadget-reachy/wake-vosk-en-us \
   --wake-phrase 'hey muse' --wake-timeout 10 \
@@ -353,7 +368,7 @@ and repeat the service's command with `--antenna-mode left` or `right`:
 ```ini
 [Service]
 ExecStart=
-ExecStart=/home/pollen/muse-reachy-venv/bin/muse-reachy run --stream-replies --antenna-mode left --tts-model /home/pollen/.local/share/musegadget-reachy/voices/en_US-lessac-medium.onnx --stt-model /home/pollen/.local/share/musegadget-reachy/whisper-tiny.en
+ExecStart=/home/pollen/muse-reachy-venv/bin/muse-reachy run --mode on-robot --stream-replies --antenna-mode left --tts-model /home/pollen/.local/share/musegadget-reachy/voices/en_US-lessac-medium.onnx --stt-model /home/pollen/.local/share/musegadget-reachy/whisper-tiny.en
 ```
 
 Run `sudo systemctl daemon-reload` and `sudo systemctl restart muse-reachy.service`
@@ -369,14 +384,18 @@ The tested Muse VM handled some isolated `output_modality: "voice"` greetings
 quickly, but robot-aware consecutive requests returned internal delegation
 controls instead of answers. That route is not qualified for this integration.
 Muse's TTS endpoint only speaks messages generated in voice mode.
-`--tts-model` uses normal Muse responses and speaks them with a
-local [Piper neural voice](https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/CLI.md).
-The words still come from Muse; the voice comes from Piper.
 
-`--stt-model` uses a local [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-worker to recognize microphone audio and sends that text to Muse. Empty speech
-does not start a conversation. The provided tiny.en model recognizes English.
-The native WAV upload path remains available without this option.
+Reachy has two modes today. In `--mode muse-voice`, Muse hears the recorded
+WAV and speaks its own reply. In `--mode on-robot`, Reachy transcribes and
+speaks locally. Muse then receives only text.
+
+`--mode on-robot` needs both `--stt-model` and `--tts-model`. The first uses a
+local [faster-whisper](https://github.com/SYSTRAN/faster-whisper) worker.
+The provided tiny.en model recognizes English. The second uses a local
+[Piper neural voice](https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/CLI.md).
+Empty speech does not start a conversation.
+The words still come from Muse. A Piper voice with Muse transcription is not
+supported.
 
 The Pi keeps a warmed recognition worker. Streaming Silero speech detection
 controls recording endpoints for local recognition; it uses the bundled model
@@ -401,7 +420,7 @@ with four active paths; it does not download assets automatically.
 
 ```sh
 pip install 'musegadget[reachy-stt-streaming]'
-muse-reachy run --stt-backend sherpa-streaming \
+muse-reachy run --mode on-robot --stt-backend sherpa-streaming \
   --stt-model /path/to/zipformer-en-2023-06-26 \
   --tts-model /path/to/voice.onnx --stream-replies
 ```
@@ -435,7 +454,7 @@ transcripts, or chat IDs. Producer gaps are not measurements of speaker underrun
 confirm audible continuity on the physical device before claiming a playback fix.
 
 Piper is a separate GPL-licensed program, invoked as a subprocess. Its model is
-not bundled with this SDK. Run without `--tts-model` to request Muse's native
+not bundled with this SDK. Use `--mode muse-voice` to request Muse's native
 voice output and stream its MP3 response once your VM supports it.
 
 ## Local face following
@@ -544,7 +563,7 @@ generating. Partial frames stay buffered, and JSON controls are never spoken.
 Completed transcripts are reconciled with already queued frames so they do
 not repeat the same speech. If Muse revises a frame already committed to
 playback, the adapter stops that message instead of replaying conflicting text.
-Streaming requires `--tts-model`. It shortens the wait after text arrives;
+Streaming needs `--mode on-robot`. It shortens the wait after text arrives;
 it cannot shorten Muse's delay before its first text.
 
 The optional field `kind` distinguishes public progress from answer chunks:

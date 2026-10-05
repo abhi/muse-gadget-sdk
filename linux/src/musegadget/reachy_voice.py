@@ -19,9 +19,8 @@ from typing import Awaitable, Callable
 
 from musegadget import __version__
 from musegadget.link_client import DeviceDescription, LinkSession, Outcome
-from musegadget.reachy_capabilities import Backends, Expression, ReplyStyle, SpokenLine
+from musegadget.reachy_capabilities import WAKE_CUE, Backends, Expression, ReplyStyle, SpokenLine
 from musegadget.reachy_expression import transcript_text
-from musegadget.reachy_local_backends import robot_backends
 from musegadget.reachy_progress import BackendStatus, ProgressPlan, backend_status_from_event
 from musegadget.service import DEFAULT_NOISE_HOST, Service
 from musegadget.speech_playback import PCMPlayer, SpeechPlayback
@@ -35,7 +34,6 @@ ECHO_TAIL_S = 0.35
 PENDING_TURN_LIMIT = 8
 INPUT_OVERFLOW_CUE = "My question queue is full. Please repeat that after I finish."
 TRANSCRIPTION_RETRY_CUE = "I missed part of that. Please say it again."
-WAKE_CUE = "Yes?"
 
 
 def strip_wake_prefix(text: str, phrase: str) -> str:
@@ -126,12 +124,19 @@ class _SpeechJob:
     on_start: Callable[[], None] | None = None
     started: float | None = None
     state: str = "speaking"
-    prepared_audio: object = None
+
+
+_SPEECH_LABELS = {
+    "ack": ("Reachy acknowledgement", "acknowledgement audio"),
+    "progress": ("Reachy progress", "progress audio"),
+    "answer": ("Muse speech", "Muse audio"),
+    "notice": ("Reachy notice", "notice audio"),
+}
 
 
 def _line(message_id: str | None, text: str, expression: str | None, *,
-          progress: bool = False) -> SpokenLine:
-    role = "progress" if progress else "answer" if message_id is not None else "notice"
+          progress: bool = False, role: str | None = None) -> SpokenLine:
+    role = role or ("progress" if progress else "answer" if message_id is not None else "notice")
     return SpokenLine(text, Expression.parse(expression), role, message_id)
 
 
@@ -503,8 +508,6 @@ class VoiceConversation:
                  wake_detector=None, wake_timeout_s: float = 10.0,
                  owns_chat: bool = False, speech_gate=None,
                  audio_diagnostics: bool = False) -> None:
-        if wake_detector is not None and (not backends.hearing.transcribes or not backends.voice.speaks_text):
-            raise ValueError("wake-word listening requires local transcription and speech")
         if not math.isfinite(wake_timeout_s) or wake_timeout_s < 0:
             raise ValueError("wake timeout must be a finite, nonnegative number")
         self.session = session
@@ -572,7 +575,7 @@ class VoiceConversation:
             job = await self._output_queue.get()
             self._output_prefetched = True
             try:
-                if job.prepared_stream is None and job.prepared_audio is None and job.text:
+                if job.prepared_stream is None and job.text:
                     job = replace(job, prepared_stream=self.backends.voice.prepare(
                         _line(job.message_id, job.text, job.expression), self.hardware.output_sample_rate))
             except BaseException:
@@ -596,8 +599,7 @@ class VoiceConversation:
                 try:
                     await self._speech_with_timeout(self._speak(
                         job.message_id, text=job.text, expression=job.expression,
-                        state=job.state, prepared_audio=job.prepared_audio,
-                        stream_segment=True, prepared_stream=job.prepared_stream,
+                        state=job.state, stream_segment=True, prepared_stream=job.prepared_stream,
                         is_current=job.is_current, on_start=job.on_start,
                         turn_started=job.started))
                 except _SpeechSuperseded:
@@ -630,7 +632,7 @@ class VoiceConversation:
 
     async def run(self) -> None:
         await self.session.registered.wait()
-        await self.prepare_acknowledgement()
+        await self.warm_up()
         subscriber = asyncio.create_task(self._subscribe())
         microphone = asyncio.create_task(self._microphone())
         try:
@@ -645,14 +647,11 @@ class VoiceConversation:
             await asyncio.gather(subscriber, microphone, return_exceptions=True)
             await asyncio.to_thread(self.hardware.clear_audio)
 
-    async def prepare_acknowledgement(self) -> None:
-        """Cache intent acknowledgements, the wake cue, and fixed progress phrases."""
-        backends = self.backends
+    async def warm_up(self) -> None:
         rate = self.hardware.output_sample_rate
-        wake = (WAKE_CUE,) if self.wake_detector is not None else ()
-        await backends.voice.cache((*backends.narrator.acknowledgements, *wake), rate)
-        if backends.progress_voice is not None:
-            await backends.progress_voice.cache(backends.narrator.progress_phrases, rate)
+        await self.backends.voice.warm(rate)
+        if self.backends.progress_voice is not None:
+            await self.backends.progress_voice.warm(rate)
 
     async def _subscribe(self) -> None:
         subscription = self.session.subscribe_chat(self.session_id)
@@ -1175,11 +1174,9 @@ class VoiceConversation:
             await finish_progress(cancel=True)
         async def announce(text: str) -> None:
             if defer_playback:
-                await self._output_queue.put(_SpeechJob(None, text, started=started,
-                    state="listening", prepared_audio=self.backends.voice.cached(text)))
+                await self._output_queue.put(_SpeechJob(None, text, started=started, state="listening"))
             else:
-                await self._speak(None, text=text, state="listening", stream_segment=True,
-                                  prepared_audio=self.backends.voice.cached(text))
+                await self._speak(None, text=text, state="listening", stream_segment=True)
         try:
             if not self._has_output() and not self._playback.user_speaking:
                 await asyncio.to_thread(self.hardware.set_state, "thinking")
@@ -1229,12 +1226,11 @@ class VoiceConversation:
                 options["output_modality"] = "voice"
             if text is not None and not self._has_output() and not self._playback.user_speaking:
                 line = await self.backends.narrator.acknowledge(text)
-                audio = self.backends.voice.cached(line.text) if line is not None else None
-                if audio:
+                if line is not None:
                     log.info("Reachy selected a question acknowledgement %.1fs after the voice turn",
                              time.monotonic() - started)
                     acknowledgement_task = asyncio.create_task(self._speak(
-                        None, text=line.text, state="thinking", prepared_audio=audio))
+                        None, text=line.text, state="thinking", role=line.role))
             if wav is None:
                 context = self._voice_context()
                 setup = (" For setup, return one sentence frame with text 'Ready to talk' and expression 'nod'. "
@@ -1311,7 +1307,6 @@ class VoiceConversation:
                                      progress.source, time.monotonic() - started)
                             progress_task = asyncio.create_task(self._speak(
                                 None, text=progress.text, state="thinking", stream_segment=True,
-                                prepared_audio=self.backends.progress_voice.cached(progress.text),
                                 voice=self.backends.progress_voice, progress=True))
                     if (self.backends.reply_style is ReplyStyle.EXPRESSIVE_JSON and not waiting_for_segment
                             and not self._has_output() and not self._playback.user_speaking):
@@ -1425,10 +1420,11 @@ class VoiceConversation:
         )
 
     async def _speak(self, message_id: str | None, *, text: str | None = None,
-                     state: str = "speaking", prepared_audio=None,
+                     state: str = "speaking",
                      expression: str | None = None, stream_segment: bool = False,
                      voice=None, progress: bool = False, prepared_stream=None,
-                     is_current=None, on_start=None, turn_started: float | None = None) -> None:
+                     is_current=None, on_start=None, turn_started: float | None = None,
+                     role: str | None = None) -> None:
         # Direct acknowledgements/progress and deferred replies share this owner.
         # Interrupted audio is flushed before a waiting speaker acquires it.
         self._speech_pending += 1
@@ -1436,10 +1432,11 @@ class VoiceConversation:
             async with self._speaker_lock:
                 try:
                     await self._speak_owned(message_id, text=text, state=state,
-                        prepared_audio=prepared_audio, expression=expression,
+                        expression=expression,
                         stream_segment=stream_segment, voice=voice,
                         progress=progress, prepared_stream=prepared_stream,
-                        is_current=is_current, on_start=on_start, turn_started=turn_started)
+                        is_current=is_current, on_start=on_start, turn_started=turn_started,
+                        role=role)
                 except BaseException as exc:
                     try:
                         await self._clear_owned_audio(propagate_cancel=False)
@@ -1477,10 +1474,11 @@ class VoiceConversation:
                 await self._clear_owned_audio()
 
     async def _speak_owned(self, message_id: str | None, *, text: str | None = None,
-                           state: str = "speaking", prepared_audio=None,
+                           state: str = "speaking",
                            expression: str | None = None, stream_segment: bool = False,
                            voice=None, progress: bool = False, prepared_stream=None,
-                           is_current=None, on_start=None, turn_started: float | None = None) -> None:
+                           is_current=None, on_start=None, turn_started: float | None = None,
+                           role: str | None = None) -> None:
         voice = voice if voice is not None else self.backends.voice
         samples_played = 0
         write_timing = {"dispatch_ms_max": 0.0, "write_ms_max": 0.0, "return_ms_max": 0.0}
@@ -1512,8 +1510,7 @@ class VoiceConversation:
                 on_start()
             if started is not None:
                 log.info("%s started %.1fs after the voice turn",
-                         "Reachy progress" if progress else
-                         "Reachy acknowledgement" if prepared_audio is not None else "Muse speech",
+                         _SPEECH_LABELS[line.role][0],
                          time.monotonic() - started)
             if expression and expression not in ("nod", "shake"):
                 log.info("Muse expressed %s while Reachy spoke", expression)
@@ -1558,6 +1555,7 @@ class VoiceConversation:
                 self.tracker.messages[message_id]["text"], self.backends.reply_style, message_id=message_id)
             text, expression = line.text, line.expression.value if line.expression else None
         text = text or ""
+        line = _line(message_id, text, expression, progress=progress, role=role)
         if voice.speaks_text and not text:
             if expression:
                 await self._express(expression)
@@ -1565,14 +1563,8 @@ class VoiceConversation:
             raise ValueError("Muse returned an empty spoken response")
         if prepared_stream is not None:
             speech = prepared_stream
-        elif prepared_audio is not None:
-            async def cached_audio():
-                for chunk in prepared_audio:
-                    yield chunk
-            speech = cached_audio()
         else:
-            speech = voice.stream(_line(message_id, text, expression, progress=progress),
-                                  self.hardware.output_sample_rate)
+            speech = voice.stream(line, self.hardware.output_sample_rate)
         try:
             try:
                 async for samples in speech:
@@ -1589,8 +1581,7 @@ class VoiceConversation:
                 await hardware_call(self.hardware.set_state, "thinking")
             log.info("Reachy spoke %.1f seconds of %s",
                      samples_played / self.hardware.output_sample_rate,
-                     "progress audio" if progress else
-                     "acknowledgement audio" if prepared_audio is not None else "Muse audio")
+                     _SPEECH_LABELS[line.role][1])
         except BaseException:
             if self._muted:
                 # Hold the unknown echo path closed until its owner flushes output.
@@ -1610,13 +1601,18 @@ class VoiceConversation:
             log.warning("Reachy rejected Muse expression %s: %s", expression, result.get("error"))
 
 
+def _backends_required():
+    raise TypeError("ReachyService requires backends")
+
+
 @dataclass
 class ReachyService(Service):
     session_id: str | None = None
     prepare_chat: Callable[[LinkSession, str], Awaitable[str]] | None = None
     owns_chat: bool = False
     silence_s: float = 2.0
-    backends: Callable[[LinkSession], Backends] = robot_backends
+    # Required: Python 3.9 dataclasses cannot follow inherited defaults with a field that has none.
+    backends: Callable[[LinkSession], Backends] = field(default_factory=_backends_required)
     audio_diagnostics: bool = False
     wake_detector: object | None = None
     wake_timeout_s: float = 10.0

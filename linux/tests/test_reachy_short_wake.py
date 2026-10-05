@@ -7,7 +7,8 @@ import wave
 import pytest
 
 from musegadget import reachy_voice, voice_audio
-from musegadget.reachy_local_backends import robot_backends
+from musegadget.reachy_capabilities import Mode
+from musegadget.reachy_local_backends import backends_for
 from musegadget.reachy_voice import VoiceConversation
 from test_reachy_voice import FakeHardware, FakeSession, bounded, cancel_task
 
@@ -82,8 +83,8 @@ def wake_scenario(monkeypatch):
         session.chat_subscribed.set()
         hardware = FakeHardware()
         conversation = VoiceConversation(session, hardware,
-                                         backends=robot_backends(session, speech=object(),
-                                                                 transcriber=Recognition()),
+                                         backends=backends_for(Mode.ON_ROBOT, session, speech=object(),
+                                                               transcriber=Recognition()),
                                          wake_detector=Wake(), silence_s=.14, wake_timeout_s=timeout)
         conversation.backends.voice.phrases["Yes?"] = (np.full(80, .1, np.float32),)
         actual_turn = conversation.turn

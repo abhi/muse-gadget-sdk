@@ -5,7 +5,8 @@ import asyncio
 import pytest
 
 from musegadget import reachy_voice
-from musegadget.reachy_local_backends import robot_backends
+from musegadget.reachy_capabilities import Mode
+from musegadget.reachy_local_backends import backends_for
 from musegadget.reachy_voice import VoiceConversation, _SpeechJob
 from test_reachy_duplex_voice import duplex
 from test_reachy_voice import FakeHardware, FakeSession, bounded, cancel_task, chat_event, sentence_frame
@@ -66,7 +67,7 @@ def test_paused_old_answer_does_not_block_next_request_and_jobs_keep_turn_scope(
         session = FakeSession(send_hook=send)
         conversation = VoiceConversation(
             session, hardware,
-                                         backends=robot_backends(session, speech=speech, stream_replies=True),
+                                         backends=backends_for(Mode.ON_ROBOT, session, speech=speech, stream_replies=True),
                                          session_id="robot-chat",
         )
         subscriber = asyncio.create_task(conversation._subscribe())
@@ -106,7 +107,7 @@ def test_cancelling_global_speaker_closes_current_stream_and_drops_queued_tail()
         speech = OrderedSpeech()
         session = FakeSession()
         conversation = VoiceConversation(session, hardware,
-                                         backends=robot_backends(session, speech=speech))
+                                         backends=backends_for(Mode.ON_ROBOT, session, speech=speech))
         conversation._playback.set_user_speaking(True)
         conversation._output_queue.put_nowait(_SpeechJob(None, "First."))
         conversation._output_queue.put_nowait(_SpeechJob(None, "Second."))
@@ -154,7 +155,7 @@ def test_final_revision_while_output_is_held_drops_every_draft_job(monkeypatch):
         session = FakeSession(send_hook=send)
         conversation = VoiceConversation(
             session, hardware,
-                                         backends=robot_backends(session, speech=speech, stream_replies=True),
+                                         backends=backends_for(Mode.ON_ROBOT, session, speech=speech, stream_replies=True),
         )
         subscriber = asyncio.create_task(conversation._subscribe())
         speaker = asyncio.create_task(conversation._play_output())

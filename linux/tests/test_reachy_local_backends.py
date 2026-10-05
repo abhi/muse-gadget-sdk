@@ -2,10 +2,8 @@ import asyncio
 
 import pytest
 
-from musegadget.reachy_capabilities import Backends, Endpoint, Expression, HeardAudio, ReplyStyle, SpokenLine
-from musegadget.reachy_local_backends import (
-    ACKNOWLEDGEMENTS, LocalHearing, LocalVoice, MuseVoice, RuleNarrator, robot_backends,
-)
+from musegadget.reachy_capabilities import Endpoint, Expression, HeardAudio, Mode, ReplyStyle, SpokenLine
+from musegadget.reachy_local_backends import LocalHearing, LocalVoice, MuseVoice, RuleNarrator, backends_for
 from musegadget.streaming_transcription import StreamingTranscriptionError
 from test_reachy_voice import FakeSession, mp3_tone  # noqa: F401
 
@@ -35,16 +33,30 @@ def test_sentence_frames_are_left_to_the_streaming_reply_tracker():
         RuleNarrator().lines('{"text":"Hi.","expression":"happy"}', ReplyStyle.EXPRESSIVE_JSON)
 
 
-@pytest.mark.parametrize("acknowledge, request_text, expected", [
-    (True, "What's the weather tomorrow?", SpokenLine("Let me check the weather.", None, "ack")),
-    (True, "Can you plan my trip to Lisbon?", SpokenLine("Let me look into that trip.", None, "ack")),
-    (True, "Hello there.", None),
-    (False, "What's the weather tomorrow?", None),
+class Speech:
+    def __init__(self):
+        self.spoken = []
+
+    async def stream(self, text, rate):
+        self.spoken.append((text, rate))
+        yield f"{text}@{rate}"
+
+
+@pytest.mark.parametrize("mode, warmed, request_text, expected", [
+    (Mode.ON_ROBOT, True, "What's the weather tomorrow?", SpokenLine("Let me check the weather.", None, "ack")),
+    (Mode.ON_ROBOT, True, "Can you plan my trip to Lisbon?", SpokenLine("Let me look into that trip.", None, "ack")),
+    (Mode.ON_ROBOT, True, "Hello there.", None),
+    (Mode.ON_ROBOT, False, "What's the weather tomorrow?", None),
+    (Mode.MUSE_VOICE, True, "What's the weather tomorrow?", None),
 ])
-def test_acknowledgement_is_a_cached_phrase_only_for_a_recognizable_request(acknowledge, request_text, expected):
-    narrator = RuleNarrator(acknowledge=acknowledge)
-    assert asyncio.run(narrator.acknowledge(request_text)) == expected
-    assert narrator.acknowledgements == (ACKNOWLEDGEMENTS if acknowledge else ())
+def test_acknowledgement_is_offered_only_once_its_phrase_can_play_at_once(mode, warmed, request_text, expected):
+    async def scenario():
+        local = {"speech": Speech(), "transcriber": "stt"} if mode is Mode.ON_ROBOT else {}
+        backends = backends_for(mode, FakeSession(), **local)
+        if warmed:
+            await backends.voice.warm(16000)
+        return await backends.narrator.acknowledge(request_text)
+    assert asyncio.run(scenario()) == expected
 
 
 def test_batch_hearing_transcribes_the_endpoint_wav():
@@ -149,21 +161,13 @@ def test_batch_hearing_turn_reports_nothing_to_a_recognizer():
     assert turn.take() == HeardAudio()
 
 
-def test_local_voice_caches_fixed_phrases_and_streams_other_text():
-    class Speech:
-        def __init__(self):
-            self.spoken = []
-
-        async def stream(self, text, rate):
-            self.spoken.append((text, rate))
-            yield f"{text}@{rate}"
-
+def test_local_voice_replays_warmed_phrases_and_synthesizes_other_text():
     async def scenario():
         speech = Speech()
-        voice = LocalVoice(speech)
-        await voice.cache(("Yes?", "Let me look that up."), 24000)
-        assert voice.cached("Yes?") == ("Yes?@24000",)
-        assert voice.cached("Hello.") is None
+        voice = LocalVoice(speech, ("Yes?", "Let me look that up."))
+        await voice.warm(24000)
+        assert [chunk async for chunk in voice.stream(SpokenLine("Yes?", None, "notice"), 24000)] == ["Yes?@24000"]
+        assert [chunk async for chunk in voice.prepare(SpokenLine("Yes?", None, "notice"), 24000)] == ["Yes?@24000"]
         assert [chunk async for chunk in voice.stream(SpokenLine("Hello.", None, "answer"), 16000)] == [
             "Hello.@16000"]
         assert voice.prepare(SpokenLine("Hello.", None, "answer"), 16000) is None
@@ -179,31 +183,16 @@ def test_muse_voice_plays_the_muse_message_mp3_and_closes_it(mp3_tone):  # noqa:
         assert session.tts_requests == ["reply-1"] and session.tts_closed == ["reply-1"]
         assert sum(len(chunk) for chunk in chunks) >= 1280
         assert voice.prepare(SpokenLine("", None, "answer", "reply-1"), 16000) is None
-        await voice.cache(("Yes?",), 16000)
-        assert voice.cached("Yes?") is None
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("speech, transcriber, stream_replies, style, acknowledgements", [
-    (None, None, False, ReplyStyle.MUSE_VOICE, ()),
-    (None, "stt", False, ReplyStyle.MUSE_VOICE, ()),
-    ("tts", None, False, ReplyStyle.MARKER, ()),
-    ("tts", "stt", False, ReplyStyle.MARKER, ACKNOWLEDGEMENTS),
-    ("tts", "stt", True, ReplyStyle.EXPRESSIVE_JSON, ACKNOWLEDGEMENTS),
+@pytest.mark.parametrize("mode, options, style, voice", [
+    (Mode.MUSE_VOICE, {}, ReplyStyle.MUSE_VOICE, MuseVoice),
+    (Mode.ON_ROBOT, {}, ReplyStyle.MARKER, LocalVoice),
+    (Mode.ON_ROBOT, {"stream_replies": True}, ReplyStyle.EXPRESSIVE_JSON, LocalVoice),
 ])
-def test_installed_models_choose_the_reply_style_and_acknowledgements(
-        speech, transcriber, stream_replies, style, acknowledgements):
-    backends = robot_backends("session", speech=speech, transcriber=transcriber, stream_replies=stream_replies)
-    assert (backends.reply_style, backends.narrator.acknowledgements) == (style, acknowledgements)
-    assert backends.voice.speaks_text is (speech is not None)
-    assert backends.hearing.transcribes is (transcriber is not None)
-
-
-@pytest.mark.parametrize("voice, style, error", [
-    (MuseVoice("session"), ReplyStyle.MARKER, "a text reply style requires local speech"),
-    (MuseVoice("session"), ReplyStyle.EXPRESSIVE_JSON, "a text reply style requires local speech"),
-    (LocalVoice("tts"), ReplyStyle.MUSE_VOICE, "Muse voice replies require Muse speech"),
-])
-def test_backends_reject_a_voice_that_cannot_speak_its_reply_style(voice, style, error):
-    with pytest.raises(ValueError, match=error):
-        Backends(LocalHearing(), voice, RuleNarrator(), style)
+def test_each_mode_assembles_its_reply_style_voice_and_hearing(mode, options, style, voice):
+    local = {"speech": "tts", "transcriber": "stt"} if mode is Mode.ON_ROBOT else {}
+    backends = backends_for(mode, "session", **local, **options)
+    assert (backends.reply_style, type(backends.voice)) == (style, voice)
+    assert backends.hearing.transcribes is (mode is Mode.ON_ROBOT)

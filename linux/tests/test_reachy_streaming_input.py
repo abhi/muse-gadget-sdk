@@ -110,9 +110,9 @@ def test_capture_gap_aborts_old_recognition_and_new_audio_starts_a_fresh_turn(du
         second.result.set_result("Only the complete new request.")
         while not ctx.session.setup_messages:
             await asyncio.sleep(0)
-        assert ctx.session.setup_messages == [("Only the complete new request.", None)]
+        assert ctx.session.setup_messages == [("Only the complete new request.", "robot-chat")]
 
-    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer)))
+    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer, owned=True)))
 
 
 def test_vad_rejected_short_sound_never_commits_its_partial_transcript(duplex):
@@ -124,7 +124,7 @@ def test_vad_rejected_short_sound_never_commits_its_partial_transcript(duplex):
         assert stream.aborted and not stream.ended
         assert ctx.session.setup_messages == []
 
-    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer)))
+    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer, owned=True)))
 
 
 def test_recognition_overflow_drops_the_whole_turn_and_keeps_listening(duplex):
