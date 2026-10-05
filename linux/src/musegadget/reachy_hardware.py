@@ -148,6 +148,7 @@ class ReachyController:
         robot_factory: Callable | None = None,
         pose_factory: Callable | None = None, pose_interpolator: Callable | None = None,
         moves_factory: Callable | None = None,
+        speaker_eq_gains: tuple[float, ...] | None = None,
     ) -> None:
         if antenna_mode not in ("both", "left", "right", "none"):
             raise ValueError("antenna_mode must be both, left, right, or none")
@@ -173,6 +174,7 @@ class ReachyController:
         self._initial_motor_mode = None
         self._robot = None
         self._speaker_eq = None
+        self._speaker_eq_gains = speaker_eq_gains
         self._np = None
         self._sample_rate = 0
         self._output_sample_rate = 0
@@ -241,8 +243,9 @@ class ReachyController:
         self._gesture_name = None
         try:
             self._robot = self._robot_factory(**self._connect_options)
-            from musegadget.reachy_speaker_eq import install_speaker_eq
-            self._speaker_eq = install_speaker_eq(self._robot.media.audio)
+            from musegadget import reachy_speaker_eq
+            self._speaker_eq = reachy_speaker_eq.install_speaker_eq(
+                self._robot.media.audio, gains=self._speaker_eq_gains or reachy_speaker_eq.SPEAKER_EQ_GAINS)
             self._sample_rate = self._robot.media.get_input_audio_samplerate()
             self._output_sample_rate = self._robot.media.get_output_audio_samplerate()
             if min(self._sample_rate, self._output_sample_rate) <= 0:

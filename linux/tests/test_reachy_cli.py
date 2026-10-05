@@ -14,6 +14,7 @@ import pytest
 
 from musegadget import config
 from musegadget import reachy_cli
+from musegadget.reachy_speaker_eq import COMPANION_SPEAKER_EQ_GAINS, SPEAKER_EQ_GAINS
 from musegadget.reachy_capabilities import ReplyStyle
 
 
@@ -592,7 +593,22 @@ def test_native_media_connects_to_local_daemon(monkeypatch):
     reachy_cli._hardware(reachy_cli.parser().parse_args(['run']))
     assert captured == {'host': 'localhost', 'port': 8000,
                         'connection_mode': 'localhost_only', 'media_backend': 'local',
-                        'enable_motion': True, 'antenna_mode': 'both', 'face_follow_model': None}
+                        'enable_motion': True, 'antenna_mode': 'both', 'face_follow_model': None,
+                        'speaker_eq_gains': SPEAKER_EQ_GAINS}
+
+
+@pytest.mark.parametrize('command, gains', [
+    (['run'], SPEAKER_EQ_GAINS),
+    (['run', '--mode', 'on-robot'], SPEAKER_EQ_GAINS),
+    (['run', '--mode', 'companion'], COMPANION_SPEAKER_EQ_GAINS),
+    (['doctor'], SPEAKER_EQ_GAINS),
+])
+def test_speaker_eq_profile_follows_the_mode_chosen_at_startup(monkeypatch, command, gains):
+    captured = {}
+    monkeypatch.setattr('musegadget.reachy_hardware.ReachyController',
+                        lambda **kwargs: captured.update(kwargs))
+    reachy_cli._hardware(reachy_cli.parser().parse_args(command))
+    assert captured['speaker_eq_gains'] == gains
 
 
 def test_remote_media_uses_supported_sdk_connection_mode(monkeypatch):

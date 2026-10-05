@@ -592,7 +592,13 @@ a later camera error disables tracking while voice stays available.
 
 The local SDK 1.9 speaker path receives the official SDK 1.10 shell equalization
 and limiter in float32 at 48 kHz, then converts back to the device's native
-output format and rate. Other media backends and SDKs with their own speaker
+output format and rate. `--mode companion` installs a gentler curve,
+`COMPANION_SPEAKER_EQ_GAINS` in `reachy_speaker_eq.py`, which halves the low
+cuts and presence boosts for the companion's Kokoro voice until a listening test
+tunes it. Other modes keep the official curve tuned for Piper. The curve is chosen
+once at startup: switching it per line would also change audio already queued in
+the pipeline, so in companion mode Reachy's own fallback voice plays through the
+companion curve too. Other media backends and SDKs with their own speaker
 correction retain their own audio path. The voice remains Piper Lessac medium;
 synthesis of Lessac high was too slow on the tested Pi.
 

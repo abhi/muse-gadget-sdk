@@ -151,6 +151,20 @@ def hardware():
     controller.close()
 
 
+def test_controller_installs_the_speaker_eq_profile_it_was_given(monkeypatch):
+    from musegadget import reachy_speaker_eq
+    installed = []
+    monkeypatch.setattr(reachy_speaker_eq, "install_speaker_eq",
+                        lambda audio, *, gains: installed.append(gains))
+    robot = FakeRobot()
+    controller = ReachyController(robot_factory=lambda **kwargs: robot, pose_factory=pose_factory,
+                                  pose_interpolator=lambda first, last, t: first,
+                                  enable_motion=False, speaker_eq_gains=(1.0,) * 10)
+    controller.start()
+    controller.close()
+    assert installed == [(1.0,) * 10]
+
+
 def test_mic_becomes_mono_and_playback_flush_keeps_recording(hardware):
     controller, robot = hardware
     robot.media.input = np.array([[0.1, 0.3], [-0.1, -0.3]], dtype=np.float32)

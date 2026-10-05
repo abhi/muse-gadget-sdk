@@ -18,10 +18,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 
+# Ten band gains in dB. The official Reachy Mini 1.10 curve, tuned for Piper's on-robot voice.
 SPEAKER_EQ_GAINS = (0.0, -13.21, -5.55, -4.28, -4.32, 5.80, 4.65, 4.90, 3.41, 0.0)
+# The companion's Kokoro voice already carries less boom and more presence: the same curve at
+# half strength until a listening test on the robot tunes it.
+COMPANION_SPEAKER_EQ_GAINS = (0.0, -6.61, -2.78, -2.14, -2.16, 2.90, 2.33, 2.45, 1.71, 0.0)
 SPEAKER_EQ_RATE = 48_000
 EQ_BIN_NAME = "muse_reachy_speaker_eq"
 _BACKEND_MODULE = "reachy_mini.media.audio_gstreamer"
@@ -74,7 +78,7 @@ def _make_element(gst: Any, factory: str, name: str) -> Any:
     return element
 
 
-def _build_eq_bin(gst: Any) -> Any:
+def _build_eq_bin(gst: Any, gains: Tuple[float, ...]) -> Any:
     eq_bin = gst.Bin.new(EQ_BIN_NAME)
     if eq_bin is None:
         raise SpeakerEqError("GStreamer could not create the speaker EQ bin")
@@ -86,7 +90,7 @@ def _build_eq_bin(gst: Any) -> Any:
     in_caps.set_property(
         "caps", gst.Caps.from_string(f"audio/x-raw,format=F32LE,rate={SPEAKER_EQ_RATE}")
     )
-    for index, gain in enumerate(SPEAKER_EQ_GAINS):
+    for index, gain in enumerate(gains):
         equalizer.set_property(f"band{index}", gain)
     limiter.set_property("threshold", 0.9)
     limiter.set_property("ratio", 0.0)
@@ -143,8 +147,12 @@ class SpeakerEqInstallation:
         return rate
 
 
-def install_speaker_eq(audio_backend: Any, *, _gst: Any = None) -> Optional[SpeakerEqInstallation]:
-    """Insert the official EQ topology into a Reachy SDK 1.9 local backend.
+def install_speaker_eq(audio_backend: Any, *, gains: Tuple[float, ...] = SPEAKER_EQ_GAINS,
+                       _gst: Any = None) -> Optional[SpeakerEqInstallation]:
+    """Insert the official EQ topology, with ``gains`` on its ten bands, into a Reachy SDK 1.9 local backend.
+
+    The curve is fixed for the life of the pipeline. Audio already queued in the pipeline
+    would take a curve changed mid-stream, so a mode picks one profile at startup.
 
     Other media backends are deliberately ignored. SDK versions that already
     expose the official ``make_speaker_eq`` helper own their correction and are
@@ -173,7 +181,7 @@ def install_speaker_eq(audio_backend: Any, *, _gst: Any = None) -> Optional[Spea
     if len(edges) != 1:
         raise SpeakerEqError(f"Expected one Reachy speaker edge, found {len(edges)}")
     upstream, sink = edges[0]
-    eq_bin = _build_eq_bin(_gst)
+    eq_bin = _build_eq_bin(_gst, gains)
     if not pipeline.add(eq_bin):
         raise SpeakerEqError("GStreamer could not add the speaker EQ to the pipeline")
     upstream.unlink(sink)

@@ -431,6 +431,9 @@ async def _probe(saved: dict):
 def _hardware(args, *, motion=True):
     from musegadget.reachy_hardware import ReachyController
     from musegadget.local_face_tracking import default_face_model
+    from musegadget.reachy_speaker_eq import COMPANION_SPEAKER_EQ_GAINS, SPEAKER_EQ_GAINS
+    # One speaker curve per mode: the GStreamer EQ cannot switch per line without glitches.
+    companion = getattr(args, "mode", None) == Mode.COMPANION.value
     face_model = None
     if getattr(args, "face_follow", False) and motion and not args.no_motion:
         face_model = args.face_follow_model or default_face_model()
@@ -438,7 +441,8 @@ def _hardware(args, *, motion=True):
                            connection_mode="localhost_only" if args.host in ("localhost", "127.0.0.1")
                            else "network", media_backend=args.media_backend,
                            enable_motion=motion and not args.no_motion,
-                           antenna_mode=args.antenna_mode, face_follow_model=face_model)
+                           antenna_mode=args.antenna_mode, face_follow_model=face_model,
+                           speaker_eq_gains=COMPANION_SPEAKER_EQ_GAINS if companion else SPEAKER_EQ_GAINS)
 
 
 async def run(args) -> int:

@@ -6,6 +6,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from musegadget.reachy_speaker_eq import (
+    COMPANION_SPEAKER_EQ_GAINS,
     EQ_BIN_NAME,
     SPEAKER_EQ_GAINS,
     SpeakerEqError,
@@ -324,3 +325,15 @@ def test_verify_returns_negotiated_rate_when_active():
     installation.eq_bin.state = FakeGst.State.PLAYING
     installation.eq_bin.get_by_name(EQ_BIN_NAME + "_bands").get_static_pad("sink").current_caps = FakeCaps(rate=48000)
     assert installation.verify_active() == 48000
+
+
+def test_piper_profile_is_the_official_curve_and_companion_profile_is_it_at_half_strength():
+    assert SPEAKER_EQ_GAINS == (0.0, -13.21, -5.55, -4.28, -4.32, 5.80, 4.65, 4.90, 3.41, 0.0)
+    assert COMPANION_SPEAKER_EQ_GAINS == (0.0, -6.61, -2.78, -2.14, -2.16, 2.90, 2.33, 2.45, 1.71, 0.0)
+
+
+def test_the_chosen_profile_sets_every_band():
+    backend, _source, _sink = make_backend()
+    installation = install_speaker_eq(backend, gains=COMPANION_SPEAKER_EQ_GAINS, _gst=FakeGst)
+    bands = {child.factory: child for child in installation.eq_bin.children}["equalizer-10bands"]
+    assert [bands.properties[f"band{i}"] for i in range(10)] == list(COMPANION_SPEAKER_EQ_GAINS)
