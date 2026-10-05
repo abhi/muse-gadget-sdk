@@ -4,7 +4,7 @@ import pytest
 
 from musegadget.reachy_capabilities import Endpoint, Expression, HeardAudio, Mode, ReplyStyle, SpokenLine
 from musegadget.reachy_local_backends import LocalHearing, LocalVoice, MuseVoice, RuleNarrator, backends_for
-from musegadget.streaming_transcription import StreamingTranscriptionError
+from musegadget.streaming_transcription import StreamingTranscriptionError, TranscriptRevision
 from test_reachy_voice import FakeSession, mp3_tone  # noqa: F401
 
 
@@ -116,6 +116,8 @@ class StreamingRecognizer:
         recognizer = self
 
         class Turn:
+            partial = TranscriptRevision(0, "")
+
             def feed(self, pcm):
                 if recognizer.fail:
                     raise StreamingTranscriptionError("recognizer lost the turn")

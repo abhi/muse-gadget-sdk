@@ -11,6 +11,7 @@
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"audio": "tts:Let me look that up.", "robot": "play"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
+  {"expression": "curious", "robot": "set_state", "state": "thinking"},
   {"robot": "cue_progress"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"audio": "progress_tts:Searching the web now.", "robot": "play"},

@@ -10,7 +10,7 @@ import time
 from typing import Callable, Optional, Tuple
 
 from musegadget.reachy_capabilities import (
-    WAKE_CUE, Backends, Endpoint, Expression, HeardAudio, Mode, ReplyStyle, SpokenLine,
+    WAKE_CUE, Backends, Endpoint, Expression, HeardAudio, Mode, Partial, ReplyStyle, SpokenLine,
 )
 from musegadget.reachy_expression import spoken_reply
 from musegadget.reachy_progress import PUBLIC_PROGRESS_PHRASES, ProgressPlan
@@ -61,6 +61,12 @@ class LocalHearingTurn:
     @property
     def last_truncated(self) -> bool:
         return self._recorder.last_truncated
+
+    @property
+    def partial(self) -> Optional[Partial]:
+        if self._turn is None or not self._turn.partial.text:
+            return None
+        return Partial(self._turn.partial.text, self._turn.partial.revision)
 
     def feed(self, samples):
         return self._recorder.feed(samples)

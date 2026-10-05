@@ -1002,7 +1002,8 @@ def test_streaming_first_frame_plays_before_done_and_expressions_match_playback(
         assert hardware.play_expressions == [("speaking", "surprised"), ("speaking", gesture)]
         assert hardware.commands == []
         assert speech.closed == speech.requests
-        assert hardware.states.count("thinking") == 1
+        assert [state for state in hardware.state_expressions if state[0] == "thinking"] == [
+            ("thinking", None), ("thinking", "nod")]
     asyncio.run(bounded(scenario()))
 
 
@@ -2912,7 +2913,8 @@ def test_ack_race_and_multiple_messages_play_real_mp3_once_each(mp3_tone, monkey
         assert session.sent == [(b"voice recording", "robot-chat")]
         assert session.tts_requests == ["reply-1", "reply-2"]
         assert session.tts_closed == ["reply-1", "reply-2"]
-        assert hardware.states == ["thinking", "speaking", "thinking", "speaking", "thinking"]
+        assert hardware.state_expressions == [("thinking", None), ("thinking", "nod"), ("speaking", None),
+                                              ("thinking", None), ("speaking", None), ("thinking", None)]
         pcm = np.concatenate(hardware.played)
         assert pcm.ndim == 1
         assert np.isfinite(pcm).all()
@@ -3243,7 +3245,8 @@ def test_real_noise_voice_note_gets_text_completion_and_paced_tts_burst(mp3_tone
                 data=mp3_tone[offset:offset + 3], end_body=offset + 3 >= len(mp3_tone),
             )))
         await speaking
-        assert hardware.states == ["thinking", "speaking", "thinking"]
+        assert hardware.state_expressions == [("thinking", None), ("thinking", "nod"), ("speaking", None),
+                                              ("thinking", None)]
         assert sum(len(samples) for samples in hardware.played) >= 640
         assert not conversation._muted
         await cancel_task(subscriber)

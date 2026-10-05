@@ -185,6 +185,39 @@ class FailingStreamingTranscriber:
         return Turn()
 
 
+class ScriptedStreamingTranscriber:
+    def __init__(self):
+        from musegadget.streaming_transcription import TranscriptRevision
+        self.partial = TranscriptRevision(0, "")
+
+    def say(self, text):
+        from musegadget.streaming_transcription import TranscriptRevision
+        self.partial = TranscriptRevision(self.partial.revision + 1, text)
+
+    async def start(self):
+        pass
+
+    def open_turn(self):
+        transcriber = self
+
+        class Turn:
+            @property
+            def partial(self):
+                return transcriber.partial
+
+            def feed(self, pcm):
+                pass
+
+            def finish(self):
+                result = asyncio.get_running_loop().create_future()
+                result.set_result(transcriber.partial.text)
+                return result
+
+            def abort(self):
+                pass
+        return Turn()
+
+
 class Wake:
     phrase = "hey muse"
 
@@ -223,6 +256,14 @@ class Rig:
 
     def voice(self, name="tts"):
         return TextCodedVoice(self.recording, name)
+
+    async def speak_live(self, transcriber, script):
+        for words, seconds in script:
+            transcriber.say(words)
+            for _ in range(round(seconds * 16000 / CHUNK)):
+                self.hardware.samples.put(np.full(CHUNK, VOICE_SAMPLE, dtype=np.float32))
+                await asyncio.sleep(CHUNK / 16000)
+        self.say(voiced_s=0)
 
     def say(self, *, voiced_s=.5, wake=False):
         chunks = [np.full(CHUNK, WAKE_SAMPLE, dtype=np.float32)] if wake else []
@@ -415,3 +456,22 @@ def test_rejected_muse_request_ends_the_conversation_in_error(monkeypatch):
     async def user():
         rig.say()
     check("muse_rejects", run_scenario(rig, service, user))
+
+
+def test_streaming_partials_tilt_and_nod_while_the_user_talks_and_never_reach_muse(monkeypatch):
+    rig = Rig(monkeypatch)
+    transcriber = ScriptedStreamingTranscriber()
+
+    async def muse(session, request):
+        await asyncio.sleep(.5)
+        await session.answer(request, "Castles kept dragons out. [reachy:happy]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=transcriber)
+
+    async def user():
+        await rig.speak_live(transcriber, [
+            ("tell me", .4), ("tell me about", .4), ("tell me about the old", .4),
+            ("tell me about the old castles", .4), ("tell me about the old castles and", .8),
+            ("tell me about the old castles and dragons", .5)])
+    check("streaming_partials", run_scenario(rig, service, user))

@@ -3,21 +3,16 @@
   {"muse": "subscribe_chat", "session_id": "robot-chat"},
   {"expression": null, "robot": "set_state", "state": "idle"},
   {"expression": null, "robot": "set_state", "state": "listening"},
+  {"expression": "listening", "robot": "set_state", "state": "listening"},
+  {"expression": "nod", "robot": "set_state", "state": "listening"},
   {"expression": null, "robot": "set_state", "state": "idle"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
-  {"muse": "send_chat", "options": {}, "session_id": "robot-chat", "text": "How does a rainbow form?"},
-  {"expression": null, "robot": "set_state", "state": "thinking"},
-  {"audio": "tts:Let me explain that.", "robot": "play"},
-  {"expression": null, "robot": "set_state", "state": "thinking"},
+  {"muse": "send_chat", "options": {}, "session_id": "robot-chat", "text": "tell me about the old castles and dragons"},
   {"expression": "nod", "robot": "set_state", "state": "thinking"},
-  {"expression": "curious", "robot": "set_state", "state": "speaking"},
-  {"audio": "tts:Sunlight bends inside raindrops.", "robot": "play"},
   {"expression": "happy", "robot": "set_state", "state": "speaking"},
-  {"audio": "tts:Each color bends a little differently.", "robot": "play"},
-  {"expression": "surprised", "robot": "set_state", "state": "speaking"},
-  {"audio": "tts:That spreads white light into a bow.", "robot": "play"},
+  {"audio": "tts:Castles kept dragons out.", "robot": "play"},
   {"expression": null, "robot": "set_state", "state": "idle"},
   {"robot": "clear_audio"}
  ],
@@ -56,8 +51,6 @@
   "progress_tts:Muse is preparing a reply. Its last reported step was searching sources.",
   "progress_tts:Muse is preparing a reply. Its last reported step was checking a website.",
   "progress_tts:Muse is preparing a reply. Its last reported step was using a connector.",
-  "tts:Sunlight bends inside raindrops.",
-  "tts:Each color bends a little differently.",
-  "tts:That spreads white light into a bow."
+  "tts:Castles kept dragons out."
  ]
 }

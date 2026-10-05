@@ -59,6 +59,7 @@ _MOTION_PERIOD_S = 0.025
 _SPEECH_GESTURE_S = 1.6
 _SPEECH_GESTURE_KEYFRAMES = ((0., 0.), (.25, 1.), (.45, 1.), (.95, -1.),
                            (1.15, -1.), (_SPEECH_GESTURE_S, 0.))
+_HEAD_GESTURES = ("nod", "shake")
 
 
 def _ease(progress: float) -> float:
@@ -331,7 +332,8 @@ class ReachyController:
         if expression is not None and expression not in BUILTIN_EXPRESSIONS:
             raise ValueError(f"Unknown reply expression: {expression}")
         with self._state_lock:
-            if state != self._state or expression != self._reply_expression or state == "speaking":
+            if (state != self._state or expression != self._reply_expression or state == "speaking"
+                    or expression in _HEAD_GESTURES or state == expression == "listening"):
                 self._state_started = time.monotonic()
             self._state = state
             self._reply_expression = expression
@@ -521,7 +523,7 @@ class ReachyController:
                     state_started = self._state_started
                     elapsed = now - state_started
                     progress_age = None if self._progress_started is None else now - self._progress_started
-                gesture = state == "speaking" and expression in ("nod", "shake")
+                gesture = state in ("speaking", "listening", "thinking") and expression in _HEAD_GESTURES
                 gesture_active = gesture and elapsed < _SPEECH_GESTURE_S
                 wants_wobbling = state == "speaking" and not gesture_active
                 if self.wobbling_available and wants_wobbling != wobbling_active:
@@ -571,11 +573,12 @@ class ReachyController:
                         gesture_anchor=self._gesture_anchor)
                     if not gesture_active:
                         pose = self._face_pose(pose)
-                    quick_cue = state == "listening" and expression == "happy" and elapsed < 1.0
-                    if state == "thinking":
-                        head_blend, antenna_blend = 0.12, 0.3
-                    elif quick_cue:
+                    quick_cue = ((state == "listening" and expression == "happy" and elapsed < 1.0)
+                                 or (gesture_active and state != "speaking"))
+                    if quick_cue:
                         head_blend, antenna_blend = 0.18, 0.3
+                    elif state == "thinking":
+                        head_blend, antenna_blend = 0.12, 0.3
                     elif state == "speaking":
                         head_blend, antenna_blend = 0.16, 0.22
                     else:
@@ -628,8 +631,27 @@ class ReachyController:
     def _state_pose(self, state: str, now: float, expression: str | None = None,
                     *, progress_age: float | None = None,
                     gesture_anchor: tuple[float, float] | None = None):
+        if expression in _HEAD_GESTURES and (state == "speaking" or state in ("listening", "thinking")
+                                             and now < _SPEECH_GESTURE_S):
+            yaw, pitch = gesture_anchor or (0.0, 0.0)
+            wave = 0.0
+            for (start, first), (end, last) in zip(
+                    _SPEECH_GESTURE_KEYFRAMES, _SPEECH_GESTURE_KEYFRAMES[1:]):
+                if now <= end:
+                    wave = first + (last - first) * _ease((now - start) / (end - start))
+                    break
+            if expression == "nod":
+                pitch += 8 * wave
+            else:
+                yaw += 10 * wave
+            yaw = max(-20, min(20, yaw))
+            pitch = max(-12, min(12, pitch))
+            return self._head(yaw=yaw, pitch=pitch), self._np.deg2rad([-10, 10])
         if state == "listening":
             coordinates, antennas = EXPRESSION_POSES.get(expression, EXPRESSION_POSES["listening"])
+            if expression == "listening":
+                tilt = math.sin(math.pi * min(1.0, max(0.0, now) / _SPEECH_GESTURE_S)) ** 2
+                coordinates = {**coordinates, "roll": 10 * tilt}
             if expression == "happy":
                 greeting = _ease(now / .2) * (1 - _ease((now - .8) / .6))
                 wiggle = math.sin(math.pi * min(1, max(0, now))) * math.sin(4 * math.pi * now)
@@ -664,25 +686,11 @@ class ReachyController:
                 direction = -1 if int((now - 9) / 30) % 2 else 1
                 if glance_age < 1.8:
                     glance = math.sin(math.pi * glance_age / 1.8) ** 2
-            pose = self._head(pitch=-3, z=4 + 2 * glance,
-                              yaw=direction * 6 * glance, roll=direction * 6 * glance)
+            lean = 10 if expression == "curious" else 0
+            pose = self._head(pitch=-3 - lean / 2, z=4 + 2 * glance,
+                              yaw=direction * 6 * glance, roll=lean + direction * 6 * glance)
             return pose, self._np.deg2rad([-10 + right, 10 - left])
         if state == "speaking":
-            if expression in ("nod", "shake"):
-                yaw, pitch = gesture_anchor or (0.0, 0.0)
-                wave = 0.0
-                for (start, first), (end, last) in zip(
-                        _SPEECH_GESTURE_KEYFRAMES, _SPEECH_GESTURE_KEYFRAMES[1:]):
-                    if now <= end:
-                        wave = first + (last - first) * _ease((now - start) / (end - start))
-                        break
-                if expression == "nod":
-                    pitch += 8 * wave
-                else:
-                    yaw += 10 * wave
-                yaw = max(-20, min(20, yaw))
-                pitch = max(-12, min(12, pitch))
-                return self._head(yaw=yaw, pitch=pitch), self._np.deg2rad([-10, 10])
             coordinates, antennas = EXPRESSION_POSES.get(expression, EXPRESSION_POSES["neutral"])
             strength = _ease(now / .35)
             strength *= 1 - .35 * _ease((now - .8) / .8)

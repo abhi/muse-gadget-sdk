@@ -89,6 +89,7 @@ class HearingTurn(Protocol):
     active: bool
     speech_active: bool
     last_truncated: bool
+    partial: Optional[Partial]     # the open utterance's transcript so far; never sent to Muse
 
     def feed(self, samples: np.ndarray) -> Optional[bytes]: ...
     def take(self) -> HeardAudio: ...

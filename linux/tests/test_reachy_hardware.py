@@ -287,6 +287,35 @@ def test_reply_pose_matches_the_emotion():
     assert controller._pose_parameters(thoughtful)["roll"] == pytest.approx(12)
 
 
+def test_listening_and_thinking_gestures_play_once_then_rest_in_the_state_pose():
+    controller = ReachyController(pose_factory=pose_factory)
+    controller._np = np
+    def head(state, age, expression):
+        return controller._pose_parameters(controller._state_pose(state, age, expression)[0])
+    assert head("listening", .45, "nod")["pitch"] == pytest.approx(8)
+    assert head("thinking", .45, "nod")["pitch"] == pytest.approx(8)
+    assert head("listening", .8, "listening")["roll"] == pytest.approx(10)
+    for state in ("listening", "thinking"):
+        np.testing.assert_allclose(controller._state_pose(state, 2, "nod")[0],
+                                   controller._state_pose(state, 2)[0], atol=1e-12)
+    np.testing.assert_allclose(controller._state_pose("listening", 2, "listening")[0],
+                               controller._state_pose("listening", 2)[0], atol=1e-12)
+    assert head("thinking", 0, "curious")["roll"] == pytest.approx(10)
+    assert head("thinking", 0, None)["roll"] == pytest.approx(0)
+
+
+def test_repeating_a_gesture_restarts_it(monkeypatch):
+    controller = ReachyController(pose_factory=pose_factory)
+    clock = iter([10.0, 20.0, 30.0, 40.0])
+    monkeypatch.setattr("musegadget.reachy_hardware.time.monotonic", lambda: next(clock))
+    controller.set_state("thinking")
+    controller.set_state("thinking")
+    assert controller._state_started == 10.0
+    controller.set_state("listening", expression="nod")
+    controller.set_state("listening", expression="nod")
+    assert controller._state_started == 30.0
+
+
 def test_unmarked_speech_stays_neutral_instead_of_taking_the_thinking_pose():
     controller = ReachyController(pose_factory=pose_factory)
     controller._np = np

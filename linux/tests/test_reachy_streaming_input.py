@@ -7,7 +7,9 @@ import pytest
 from test_reachy_duplex_voice import duplex
 from test_reachy_duplex import OrderedSpeech
 from test_reachy_voice import bounded
-from musegadget.streaming_transcription import StreamingBufferOverflow, StreamingTranscriptionError
+from musegadget.streaming_transcription import (
+    StreamingBufferOverflow, StreamingTranscriptionError, TranscriptRevision,
+)
 
 
 class StreamingRecognizer:
@@ -27,6 +29,8 @@ class StreamingRecognizer:
 
 
 class Stream:
+    partial = TranscriptRevision(0, "")
+
     def __init__(self):
         self.audio = bytearray()
         self.ended = False
