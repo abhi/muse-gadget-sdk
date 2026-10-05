@@ -427,7 +427,7 @@ def test_full_queue_preserves_eight_questions_and_speaks_one_retry_notice(duplex
 
     async def run(ctx):
         acknowledged = [asyncio.Event() for _ in range(9)]
-        ctx.conversation.backends = replace(ctx.conversation.backends, reply_style=ReplyStyle.EXPRESSIVE_JSON)
+        ctx.conversation.backends = replace(ctx.conversation.backends, local_style=ReplyStyle.EXPRESSIVE_JSON)
 
         async def acknowledge(session):
             index = len(session.setup_messages) - 1

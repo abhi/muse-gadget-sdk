@@ -399,9 +399,10 @@ async def run(args) -> int:
     robot = _hardware(args)
     dedicated_chat = None
     if not args.main_chat and not args.session_id:
+        from musegadget.reachy_capabilities import ReplyStyle
         from musegadget.reachy_expression import voice_context
         context = voice_context(
-            stream_replies=args.stream_replies,
+            ReplyStyle.EXPRESSIVE_JSON if args.stream_replies else ReplyStyle.MARKER,
             motion_enabled=getattr(robot, "motion_enabled", True),
             antenna_mode=getattr(robot, "antenna_mode", "both"),
             face_tracking_enabled=getattr(robot, "face_tracking_enabled", False),

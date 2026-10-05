@@ -16,21 +16,33 @@ def test_expression_parse_maps_unknown_names_to_no_gesture(name, expected):
     assert Expression.parse(name) is expected
 
 
+def narrated(reply, style, **options):
+    return asyncio.run(RuleNarrator().lines("the request", reply, style, **options))
+
+
 def test_marker_reply_becomes_one_line_with_its_last_known_expression():
     reply = "Octopuses have three hearts. [reachy:curious] [reachy:surprised]"
-    assert RuleNarrator().lines(reply, ReplyStyle.MARKER) == (
+    assert narrated(reply, ReplyStyle.MARKER) == (
         SpokenLine("Octopuses have three hearts.", Expression.SURPRISED, "answer"),)
 
 
 def test_muse_voice_reply_line_names_the_muse_message_that_holds_its_audio():
     reply = "Sunny and warm all day. [reachy:welcoming1]"
-    assert RuleNarrator().lines(reply, ReplyStyle.MUSE_VOICE, message_id="reply-1") == (
+    assert narrated(reply, ReplyStyle.MUSE_VOICE, message_id="reply-1") == (
         SpokenLine("Sunny and warm all day.", None, "answer", "reply-1"),)
+
+
+def test_plain_reply_is_spoken_sentence_by_sentence_without_gestures():
+    reply = "Octopuses have three hearts. Two pump blood to the gills!  One pumps it everywhere else."
+    assert narrated(reply, ReplyStyle.PLAIN_SHORT, message_id="reply-1") == (
+        SpokenLine("Octopuses have three hearts.", None, "answer"),
+        SpokenLine("Two pump blood to the gills!", None, "answer"),
+        SpokenLine("One pumps it everywhere else.", None, "answer"))
 
 
 def test_sentence_frames_are_left_to_the_streaming_reply_tracker():
     with pytest.raises(ValueError, match="parsed as they stream"):
-        RuleNarrator().lines('{"text":"Hi.","expression":"happy"}', ReplyStyle.EXPRESSIVE_JSON)
+        narrated('{"text":"Hi.","expression":"happy"}', ReplyStyle.EXPRESSIVE_JSON)
 
 
 class Speech:
@@ -215,5 +227,5 @@ def test_muse_voice_plays_the_muse_message_mp3_and_closes_it(mp3_tone):  # noqa:
 def test_each_mode_assembles_its_reply_style_voice_and_hearing(mode, options, style, voice):
     local = {"speech": "tts", "transcriber": "stt"} if mode is Mode.ON_ROBOT else {}
     backends = backends_for(mode, "session", **local, **options)
-    assert (backends.reply_style, type(backends.voice)) == (style, voice)
+    assert (backends.reply_style(), type(backends.voice)) == (style, voice)
     assert backends.hearing.transcribes is (mode is Mode.ON_ROBOT)

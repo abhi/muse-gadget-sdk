@@ -678,7 +678,7 @@ def test_streaming_option_reaches_the_conversation_service(tmp_path, monkeypatch
                            '--stt-model', str(tmp_path / 'whisper'), '--tts-model',
                            str(tmp_path / 'voice.onnx'), '--stream-replies']) == 0
     backends = captured['backends'](object())
-    assert backends.reply_style is ReplyStyle.EXPRESSIVE_JSON
+    assert backends.reply_style() is ReplyStyle.EXPRESSIVE_JSON
     assert backends.voice.speech is speech
     assert backends.progress_voice.speech is progress_speech
     assert calls == ['hardware started', 'speech started', 'progress speech started', 'transcriber started',
@@ -992,4 +992,4 @@ def test_each_mode_starts_the_conversation_with_its_reply_style_and_voice(tmp_pa
     monkeypatch.setattr('musegadget.reachy_voice.ReachyService', Service)
     assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', *argv]) == 0
     backends = captured['backends'](object())
-    assert (backends.reply_style, type(backends.voice).__name__) == (style, voice)
+    assert (backends.reply_style(), type(backends.voice).__name__) == (style, voice)

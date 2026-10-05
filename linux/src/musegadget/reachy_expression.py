@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import json
 import re
 
-from musegadget.reachy_capabilities import Expression
+from musegadget.reachy_capabilities import Expression, ReplyStyle
 
 REACHY_CAPABILITIES = (
     "You are Muse speaking through Reachy Mini, a tabletop robot with a microphone, "
@@ -47,12 +47,27 @@ STREAM_VOICE_CONTEXT = _CONVERSATION_CONTEXT + (
 )
 
 
-def voice_context(*, stream_replies: bool, motion_enabled: bool = True,
+PLAIN_VOICE_CONTEXT = REACHY_CAPABILITIES + (
+    "Answer in one to three short, plain spoken sentences, leading with the answer. "
+    "Use no markup, lists, emoji, JSON or expression markers. "
+    "Check time-sensitive facts with available tools and say plainly what you could not verify. "
+    "These instructions replace earlier Reachy conversation instructions."
+)
+
+_CONTEXTS = {
+    ReplyStyle.MUSE_VOICE: VOICE_CONTEXT,
+    ReplyStyle.MARKER: VOICE_CONTEXT,
+    ReplyStyle.EXPRESSIVE_JSON: STREAM_VOICE_CONTEXT,
+    ReplyStyle.PLAIN_SHORT: PLAIN_VOICE_CONTEXT,
+}
+
+
+def voice_context(style: ReplyStyle, *, motion_enabled: bool = True,
                   antenna_mode: str = "both", face_tracking_enabled: bool = False) -> str:
     """Describe the configured robot and the reply format for one chat."""
     if antenna_mode not in ("both", "left", "right", "none"):
         raise ValueError("invalid Reachy antenna mode")
-    context = STREAM_VOICE_CONTEXT if stream_replies else VOICE_CONTEXT
+    context = _CONTEXTS[style]
     if not motion_enabled:
         context += " Movement is disabled in this session; do not promise to perform a movement."
     else:

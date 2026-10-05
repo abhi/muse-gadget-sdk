@@ -526,7 +526,10 @@ class VoiceConversation:
         self._wake_deadline = None
         self._wake_strip_required = False
         self._wake_first_request_pending = False
-        self._voice_context_sent = False
+        # The style Muse was last told to answer in. A dedicated chat was set up with the
+        # local style; a shared wake chat learns it from the first request.
+        self._muse_style: ReplyStyle | None = (
+            None if wake_detector is not None and not owns_chat else backends.local_style)
         self.tracker: ReplyTracker | None = None
         self._replies: asyncio.Queue[str | SpeechSegment | TaskFinished] = asyncio.Queue(maxsize=32)
         self._seen_sequences: set[int] = set()
@@ -900,7 +903,7 @@ class VoiceConversation:
 
         await self._plan(plan.Started())
         turn_task = (asyncio.create_task(self.turn(None))
-                     if self.backends.reply_style is not ReplyStyle.MUSE_VOICE
+                     if self.backends.local_style is not ReplyStyle.MUSE_VOICE
                      and wake is None and not self.owns_chat else None)
         pending_turns = deque()
         turns_awaiting_transcript = set()
@@ -940,6 +943,10 @@ class VoiceConversation:
                 if speaker.done():
                     speaker.result()
                     raise ConnectionError("Reachy speaker ended")
+                notice = self.backends.take_notice() if not self._output_queue.full() else None
+                if notice is not None:
+                    log.warning("Reachy's companion stopped answering; using on-robot speech")
+                    self._output_queue.put_nowait(_SpeechJob(None, notice, state="listening"))
                 if retry_notice_pending and not self._output_queue.full():
                     self._output_queue.put_nowait(_SpeechJob(
                         None, TRANSCRIPTION_RETRY_CUE, expression="curious", state="listening"))
@@ -1244,7 +1251,8 @@ class VoiceConversation:
                 log.info("Recognized %d characters from Reachy's microphone", len(text))
                 await self._plan(plan.Working(output=self._has_output(),
                                               user_speaking=self._playback.user_speaking))
-            self.tracker = ReplyTracker(self.session_id, style=self.backends.reply_style,
+            style = self.backends.reply_style()
+            self.tracker = ReplyTracker(self.session_id, style=style,
                                         owns_chat=self.owns_chat, replay_scope=self._replay_scope)
             self._logged_activity = None
             self._activity_log_count = 0
@@ -1254,31 +1262,16 @@ class VoiceConversation:
             request_text = text or ""
             response_deadline = time.monotonic() + self.reply_timeout_s
             options = {}
-            if self.backends.reply_style is ReplyStyle.MUSE_VOICE:
+            if style is ReplyStyle.MUSE_VOICE:
                 options["output_modality"] = "voice"
             if text is not None and not self._has_output() and not self._playback.user_speaking:
-                line = await self.backends.narrator.acknowledge(text)
-                if line is not None:
-                    log.info("Reachy selected a question acknowledgement %.1fs after the voice turn",
-                             time.monotonic() - started)
-                    acknowledgement_task = asyncio.create_task(self._speak(
-                        None, text=line.text, state="thinking", role=line.role))
+                acknowledgement_task = asyncio.create_task(self._acknowledge(text, started))
             if wav is None:
-                context = self._voice_context()
-                setup = (" For setup, return one sentence frame with text 'Ready to talk' and expression 'nod'. "
-                         "Keep using this sentence protocol for subsequent spoken messages."
-                         if self.backends.reply_style is ReplyStyle.EXPRESSIVE_JSON else
-                         " For setup, say 'Ready to talk' and append [reachy:nod]. "
-                         "Keep using this expression channel for subsequent spoken messages.")
-                ack = await self.session.send_chat(
-                    context + setup,
-                    self.session_id)
+                ack = await self.session.send_chat(self._voice_context(style) + _SETUP_REQUEST[style],
+                                                   self.session_id)
             elif text is not None:
-                if (not self.owns_chat and self.wake_detector is not None
-                        and not self._voice_context_sent):
-                    context = self._voice_context()
-                    text = context + "\n\nThe user's spoken request is: " + text
-                ack = await self.session.send_chat(text, self.session_id, **options)
+                ack = await self.session.send_chat(self._ensure_muse_style(style, text),
+                                                   self.session_id, **options)
             else:
                 ack = await self.session.send_voice(wav, self.session_id, **options)
             if not ack.get("ok"):
@@ -1286,7 +1279,8 @@ class VoiceConversation:
             response = ack.get("response")
             if not isinstance(response, dict):
                 raise ValueError("Muse did not acknowledge the voice note")
-            self._voice_context_sent = True
+            if text is not None or wav is None:
+                self._muse_style = style
             if wav is not None and self.backends.progress_voice is not None:
                 self._progress = self.backends.narrator.progress(request_text, time.monotonic())
             await self._queue_replies(self.tracker.acknowledge(response), self.tracker)
@@ -1299,6 +1293,7 @@ class VoiceConversation:
                 await acknowledgement_task
             played = False
             waiting_for_segment = False
+            progress_said = []
             while True:
                 now = time.monotonic()
                 if self.tracker.task_finished:
@@ -1338,10 +1333,9 @@ class VoiceConversation:
                         if progress is not None:
                             log.info("Reachy selected %s progress %.1fs after the voice turn",
                                      progress.source, time.monotonic() - started)
-                            progress_task = asyncio.create_task(self._speak(
-                                None, text=progress.text, state="thinking", stream_segment=True,
-                                voice=self.backends.progress_voice, progress=True))
-                    if (self.backends.reply_style is ReplyStyle.EXPRESSIVE_JSON and not waiting_for_segment
+                            progress_task = asyncio.create_task(
+                                self._say_progress(request_text, progress.text, progress_said))
+                    if (style is ReplyStyle.EXPRESSIVE_JSON and not waiting_for_segment
                             and not self._has_output() and not self._playback.user_speaking):
                         await self._plan(plan.Working(output=False, user_speaking=False))
                         waiting_for_segment = True
@@ -1384,18 +1378,19 @@ class VoiceConversation:
                     await stop_progress()
                     if not played and wav is not None:
                         await self._plan(plan.AnswerArrived(output=self._has_output()))
+                    lines = await self.backends.narrator.lines(
+                        request_text, self.tracker.messages[reply]["text"], style, message_id=reply)
                     if defer_playback:
-                        line, = self.backends.narrator.lines(
-                            self.tracker.messages[reply]["text"], self.backends.reply_style, message_id=reply)
                         queued_at = time.monotonic()
-                        await self._output_queue.put(_SpeechJob(
-                            reply, line.text, line.expression.value if line.expression else None,
-                            started=started))
+                        for line in lines:
+                            await self._output_queue.put(_SpeechJob(
+                                reply, line.text, line.expression.value if line.expression else None,
+                                started=started))
                         response_deadline += time.monotonic() - queued_at
                         played = True
                         continue
                     prepared = None
-                    speaking = self._speak(reply)
+                    speaking = self._speak_lines(reply, lines)
                 waiting_for_segment = False
                 speech_started = time.monotonic()
                 try:
@@ -1447,10 +1442,37 @@ class VoiceConversation:
                 finally:
                     log.info("Reachy voice turn ended")
 
-    def _voice_context(self) -> str:
+    async def _acknowledge(self, request: str, started: float) -> None:
+        line = await self.backends.narrator.acknowledge(request)
+        if line is not None:
+            log.info("Reachy selected a question acknowledgement %.1fs after the voice turn",
+                     time.monotonic() - started)
+            await self._speak(None, text=line.text, state="thinking", role=line.role)
+
+    async def _say_progress(self, request: str, status: str, already_said: list) -> None:
+        line = await self.backends.narrator.say_progress(request, status, tuple(already_said))
+        if line is not None:
+            already_said.append(line.text)
+            await self._speak(None, text=line.text, state="thinking", stream_segment=True,
+                              voice=self.backends.progress_voice, progress=True)
+
+    async def _speak_lines(self, message_id: str, lines) -> None:
+        for index, line in enumerate(lines):
+            await self._speak(message_id, text=line.text,
+                              expression=line.expression.value if line.expression else None,
+                              stream_segment=index < len(lines) - 1)
+
+    def _ensure_muse_style(self, style: ReplyStyle, text: str) -> str:
+        """The request, prefixed with the voice setup when Muse last heard another style."""
+        if style is self._muse_style:
+            return text
+        log.info("Reachy switched Muse's reply style to %s", style.value)
+        return self._voice_context(style) + "\n\nThe user's spoken request is: " + text
+
+    def _voice_context(self, style: ReplyStyle | None = None) -> str:
         from musegadget.reachy_expression import voice_context
         return voice_context(
-            stream_replies=self.backends.reply_style is ReplyStyle.EXPRESSIVE_JSON,
+            style or self.backends.local_style,
             motion_enabled=getattr(self.hardware, "motion_enabled", True),
             antenna_mode=getattr(self.hardware, "antenna_mode", "both"),
             face_tracking_enabled=getattr(self.hardware, "face_tracking_enabled", False),
@@ -1587,10 +1609,6 @@ class VoiceConversation:
         player = PCMPlayer(self.hardware.output_sample_rate, push, self._playback,
                            on_start=begin, on_pause=pause, on_resume=resume,
                            diagnostics=self.audio_diagnostics)
-        if text is None and self.tracker is not None:
-            line, = self.backends.narrator.lines(
-                self.tracker.messages[message_id]["text"], self.backends.reply_style, message_id=message_id)
-            text, expression = line.text, line.expression.value if line.expression else None
         text = text or ""
         line = _line(message_id, text, expression, progress=progress, role=role)
         if voice.speaks_text and not text:
@@ -1637,6 +1655,15 @@ class VoiceConversation:
             log.info("Muse expressed %s through Reachy", expression)
         else:
             log.warning("Reachy rejected Muse expression %s: %s", expression, result.get("error"))
+
+
+_SETUP_REQUEST = {
+    ReplyStyle.EXPRESSIVE_JSON: (" For setup, return one sentence frame with text 'Ready to talk' and expression "
+                                 "'nod'. Keep using this sentence protocol for subsequent spoken messages."),
+    ReplyStyle.MARKER: (" For setup, say 'Ready to talk' and append [reachy:nod]. "
+                        "Keep using this expression channel for subsequent spoken messages."),
+    ReplyStyle.PLAIN_SHORT: " For setup, say 'Ready to talk'. Keep this plain style for subsequent spoken messages.",
+}
 
 
 def _backends_required():

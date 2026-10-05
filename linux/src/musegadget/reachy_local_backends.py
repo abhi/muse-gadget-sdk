@@ -300,25 +300,35 @@ class RuleNarrator:
     def progress(self, request: str, started: float) -> ProgressPlan:
         return ProgressPlan(request, started)
 
-    def lines(self, reply: str, style: ReplyStyle, *,
-              message_id: Optional[str] = None) -> Tuple[SpokenLine, ...]:
+    async def say_progress(self, request: str, status: str,
+                           already_said: Tuple[str, ...]) -> Optional[SpokenLine]:
+        return SpokenLine(status, None, "progress")
+
+    async def lines(self, request: str, reply: str, style: ReplyStyle, *,
+                    message_id: Optional[str] = None) -> Tuple[SpokenLine, ...]:
         if style is ReplyStyle.EXPRESSIVE_JSON:
             raise ValueError("sentence frames are parsed as they stream, by the reply tracker")
         text, expression = spoken_reply(reply)
+        if style is ReplyStyle.PLAIN_SHORT:
+            return tuple(SpokenLine(sentence, None, "answer") for sentence in split_sentences(text))
         return (SpokenLine(text, Expression.parse(expression), "answer", message_id),)
+
+
+def split_sentences(text: str) -> Tuple[str, ...]:
+    return tuple(part for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part)
 
 
 def backends_for(mode: Mode, session, *, speech=None, progress_speech=None, transcriber=None,
                  stream_replies: bool = False, wake: bool = False) -> Backends:
     if mode is Mode.MUSE_VOICE:
         return Backends(hearing=LocalHearing(), voice=MuseVoice(session), narrator=RuleNarrator(),
-                        reply_style=ReplyStyle.MUSE_VOICE)
+                        local_style=ReplyStyle.MUSE_VOICE)
     voice = LocalVoice(speech, (*ACKNOWLEDGEMENTS, *((WAKE_CUE,) if wake else ())))
     return Backends(
         hearing=LocalHearing(transcriber),
         voice=voice,
         narrator=RuleNarrator(presynthesized=voice.is_presynthesized),
-        reply_style=ReplyStyle.EXPRESSIVE_JSON if stream_replies else ReplyStyle.MARKER,
+        local_style=ReplyStyle.EXPRESSIVE_JSON if stream_replies else ReplyStyle.MARKER,
         progress_voice=(None if progress_speech is None
                         else LocalVoice(progress_speech, PUBLIC_PROGRESS_PHRASES)),
     )

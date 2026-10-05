@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from musegadget.reachy_capabilities import ReplyStyle
 from musegadget.reachy_expression import (
     ReplyProtocolError, ReplyRevisionError, SentenceStream, SpokenSentence,
     STREAM_VOICE_CONTEXT, spoken_reply, transcript_text,
@@ -340,7 +341,7 @@ def test_both_voice_formats_describe_actual_robot_capabilities_and_expression_ch
 ])
 def test_voice_context_records_reply_format_and_actual_capabilities(mode, expected):
     from musegadget.reachy_expression import voice_context
-    context = voice_context(stream_replies=True, antenna_mode=mode,
+    context = voice_context(ReplyStyle.EXPRESSIVE_JSON, antenna_mode=mode,
                             face_tracking_enabled=True)
     assert "one JSON object per line" in context
     assert expected in context
@@ -350,12 +351,12 @@ def test_voice_context_records_reply_format_and_actual_capabilities(mode, expect
 
 def test_voice_context_records_disabled_motion_and_rejects_unknown_antenna_mode():
     from musegadget.reachy_expression import voice_context
-    context = voice_context(stream_replies=False, motion_enabled=False, antenna_mode="both")
+    context = voice_context(ReplyStyle.MARKER, motion_enabled=False, antenna_mode="both")
     assert "Append one expression marker" in context
     assert "Movement is disabled" in context
     assert "Both antennas are enabled" not in context
     with pytest.raises(ValueError, match="antenna mode"):
-        voice_context(stream_replies=True, antenna_mode="broken")
+        voice_context(ReplyStyle.EXPRESSIVE_JSON, antenna_mode="broken")
 
 
 def test_detailed_progress_preserves_the_answer_and_its_expressions():

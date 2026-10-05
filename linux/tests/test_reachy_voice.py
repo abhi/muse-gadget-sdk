@@ -1642,9 +1642,9 @@ def test_reply_emotion_is_present_during_speech_without_a_delayed_extra_move(mon
         session = FakeSession()
         conversation = VoiceConversation(session, hardware,
                                          backends=backends_for(Mode.ON_ROBOT, session, speech=LocalSpeech()))
-        conversation.tracker = ReplyTracker()
-        conversation.tracker.messages["reply-1"] = {"text": "That's wonderful. [reachy:happy]"}
-        await conversation._speak("reply-1")
+        lines = await conversation.backends.narrator.lines(
+            "Guess what?", "That's wonderful. [reachy:happy]", ReplyStyle.MARKER, message_id="reply-1")
+        await conversation._speak_lines("reply-1", lines)
         assert ("speaking", "happy") in hardware.state_expressions
         assert hardware.commands == []
         assert hardware.played
@@ -2752,14 +2752,14 @@ def test_marker_only_response_moves_silently_or_fails_without_motion(marker, exp
         session = FakeSession()
         conversation = VoiceConversation(session, hardware,
                                          backends=backends_for(Mode.ON_ROBOT, session, speech=UnusedSpeech()))
-        conversation.tracker = ReplyTracker()
-        conversation.tracker.messages["reply-1"] = {"text": f"[reachy:{marker}]"}
+        lines = await conversation.backends.narrator.lines(
+            "Nod for me.", f"[reachy:{marker}]", ReplyStyle.MARKER, message_id="reply-1")
         if expected:
-            await conversation._speak("reply-1")
+            await conversation._speak_lines("reply-1", lines)
             assert hardware.commands == [("reachy.expression", {"name": expected})]
         else:
             with pytest.raises(ValueError, match="empty spoken response"):
-                await conversation._speak("reply-1")
+                await conversation._speak_lines("reply-1", lines)
             assert hardware.commands == []
         assert hardware.played == []
 
