@@ -60,7 +60,7 @@ def test_a_late_endpoint_keeps_the_next_utterances_opening_for_a_replay():
     # The first utterance ends at sample 500; its endpoint arrives after 1000 samples were fed.
     companion = ScriptedHearing(ScriptedTurn([HeardAudio(EndedLate(500)), CapabilityUnavailable("gone")]))
     local = ScriptedHearing(ScriptedTurn([]))
-    turn = FailoverHearing(companion, local).open_turn(16000)
+    turn = FailoverHearing(companion, local, CompanionRoute(Link()).hearing).open_turn(16000)
     for chunk in range(10):
         turn.feed(np.full(100, chunk, dtype=np.float32))
     assert turn.take().ended is not None
@@ -161,3 +161,24 @@ def test_a_rested_narrator_is_asked_again_after_the_cooldown(monkeypatch):
         return said
     assert asyncio.run(run()) == ["Okay."] * 5
     assert companion.asked == 4
+
+
+def test_rested_hearing_stays_on_the_robot_and_is_tried_again_after_the_cooldown(monkeypatch):
+    monkeypatch.setattr(reachy_failover, "COOLDOWN_S", .2)
+    gone = CapabilityUnavailable("the companion did not end the turn", link_down=False)
+    lost = CapabilityUnavailable("the link dropped")
+    companion = ScriptedHearing(*(ScriptedTurn([outcome]) for outcome in (gone, lost, gone, gone)), ScriptedTurn([]))
+    local = ScriptedHearing(*(ScriptedTurn([]) for _ in range(6)))
+    hearing = FailoverHearing(companion, local, CompanionRoute(Link()).hearing)
+
+    def window():
+        hearing.open_turn(16000).take()
+        return (len(companion.opened), len(local.opened))
+
+    async def run():
+        heard = [window() for _ in range(5)]
+        await asyncio.sleep(.3)
+        return heard + [window()]
+    # A lost link is no strike, so the third failure that rests hearing is the fourth window's. The
+    # fifth window is heard on the robot alone, and after the cooldown the companion hears again.
+    assert asyncio.run(run()) == [(1, 1), (2, 2), (3, 3), (4, 4), (4, 5), (5, 5)]

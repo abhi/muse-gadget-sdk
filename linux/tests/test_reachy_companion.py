@@ -377,6 +377,33 @@ def test_a_companion_that_hears_nothing_mid_utterance_is_replaced_by_the_robot(m
     scenario(run())
 
 
+def hear_streams_opened(companion):
+    return [message.stream for message in (decode(frame, sender=Sender.ROBOT) for frame in companion.received
+                                           if isinstance(frame, str)) if isinstance(message, HearOpen)]
+
+
+def test_three_turns_the_companion_never_ends_rest_only_its_hearing(monkeypatch):
+    from musegadget import reachy_companion_client
+    monkeypatch.setattr(reachy_companion_client, "ENDPOINT_WAIT_S", .5)
+
+    async def run():
+        async with FakeCompanion(partials=PARTIALS, frames_per_partial=12, no_endpoint=True) as companion:
+            robot = Conversation(monkeypatch, companion.url[:-3], answer("Castles kept dragons out."),
+                                 transcript="what the robot heard")
+
+            async def user():
+                await robot.until(lambda: robot.link.state is LinkState.UP)
+                await robot.turns(4)
+            await robot.run(user)
+            # Turn four is heard on the robot alone; the companion still speaks every answer.
+            assert hear_streams_opened(companion) == [1, 3, 5]
+            assert [request.endswith("what the robot heard") for request in robot.requests()] == [True] * 4
+            assert spoken_by_companion(companion).count("Castles kept dragons out.") == 4
+            assert robot.notices() == []
+            assert robot.transitions_before_stop == [LinkState.CONNECTING, LinkState.UP]
+    scenario(run())
+
+
 def test_a_reply_too_long_to_narrate_is_spoken_whole_by_the_robot_without_resting_the_narrator(monkeypatch):
     walls = f"Castles kept {'very ' * 900}tall walls."
     moats = f"Their moats were {'very ' * 900}deep."

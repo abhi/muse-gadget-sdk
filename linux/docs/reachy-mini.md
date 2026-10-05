@@ -135,7 +135,9 @@ token. If the companion stops answering, Reachy says once: "My companion
 computer isn't answering, so I'll use my own voice for now." It finishes the
 current turn with its own models, from the audio it already heard. It does the
 same, without the notice, for a turn the companion stops transcribing or does
-not end within 3 seconds of your last word. When the
+not end within 3 seconds of your last word. After three such turns in a row,
+Reachy hears on its own for a minute, still without the notice, and then
+gives the companion's hearing another try. When the
 companion has been back for 10 seconds, Reachy uses it again from the next turn.
 A companion that keeps dropping right after it connects is announced once, not
 on every reconnect.

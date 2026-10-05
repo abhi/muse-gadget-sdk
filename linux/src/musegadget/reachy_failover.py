@@ -63,6 +63,7 @@ class CompanionRoute:
     def __init__(self, link):
         self.link = link
         self.this_turn = False
+        self.hearing = _Rest("hearing")
         self.speech = _Rest("voice")
         self.narration = _Rest("narration")
 
@@ -92,7 +93,7 @@ class FailoverHearingTurn:
         self._fed = 0
         self._turn_start_sample = 0
         self._replay = None
-        self._on_companion = hearing.companion.available
+        self._on_companion = hearing.companion_ready
         self._turn = (hearing.companion if self._on_companion else hearing.local).open_turn(sample_rate, **options)
 
     @property
@@ -141,7 +142,7 @@ class FailoverHearingTurn:
     def take(self) -> HeardAudio:
         if not self._on_companion:
             heard = self._turn.take()
-            if (self._hearing.companion.available and heard.ended is None and self._replay is None
+            if (self._hearing.companion_ready and heard.ended is None and self._replay is None
                     and not self._turn.active):
                 self._switch(on_companion=True)
             return heard
@@ -149,10 +150,13 @@ class FailoverHearingTurn:
             heard = self._turn.take()
         except CapabilityUnavailable as error:
             log.warning("Reachy's companion stopped hearing (%s); finishing the turn on the robot", error)
+            if not error.link_down:
+                self._hearing.rest.fail(str(error))
             self._replay = tuple(self._kept)
             self._switch(on_companion=False)
             return HeardAudio()
         if heard.ended is not None:
+            self._hearing.rest.succeed()
             self._forget_until(self._turn_start_sample + heard.ended.end_sample)
         elif not self._turn.active:
             self._trim(IDLE_KEEP_S)
@@ -175,9 +179,14 @@ class FailoverHearingTurn:
 
 
 class FailoverHearing:
-    def __init__(self, companion, local):
+    def __init__(self, companion, local, rest: _Rest):
         self.companion = companion
         self.local = local
+        self.rest = rest
+
+    @property
+    def companion_ready(self) -> bool:
+        return self.companion.available and not self.rest.resting
 
     @property
     def transcribes(self) -> bool:
@@ -325,7 +334,7 @@ def companion_backends(local: Backends, link) -> Backends:
     progress = (None if local.progress_voice is None
                 else FailoverVoice(CompanionVoice(link, VoiceRole.PROGRESS), local.progress_voice, route))
     return Backends(
-        hearing=FailoverHearing(CompanionHearing(link), local.hearing),
+        hearing=FailoverHearing(CompanionHearing(link), local.hearing, route.hearing),
         voice=FailoverVoice(CompanionVoice(link), local.voice, route),
         narrator=FailoverNarrator(CompanionNarrator(link), local.narrator, route),
         local_style=local.local_style,
