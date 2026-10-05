@@ -1,0 +1,19 @@
+{
+ "events": [
+  {"muse": "subscribe_chat", "session_id": "robot-chat"},
+  {"expression": null, "robot": "set_state", "state": "idle"},
+  {"expression": null, "robot": "set_state", "state": "listening"},
+  {"expression": null, "robot": "set_state", "state": "idle"},
+  {"expression": null, "robot": "set_state", "state": "thinking"},
+  {"expression": null, "robot": "set_state", "state": "thinking"},
+  {"muse": "send_voice", "options": {"output_modality": "voice"}, "session_id": "robot-chat", "wav_bytes": 22444},
+  {"message_id": "reply-1", "muse": "stream_tts"},
+  {"expression": "surprised", "robot": "set_state", "state": "speaking"},
+  {"audio": "mp3:reply-1", "robot": "play"},
+  {"expression": null, "robot": "set_state", "state": "thinking"},
+  {"robot": "clear_audio"},
+  {"expression": null, "robot": "set_state", "state": "idle"},
+  {"robot": "clear_audio"}
+ ],
+ "synthesized": []
+}
