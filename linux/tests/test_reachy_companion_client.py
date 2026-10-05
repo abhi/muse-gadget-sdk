@@ -9,7 +9,7 @@ import ssl
 import pytest
 
 from fake_companion import TOKEN, FakeCompanion
-from musegadget.reachy_capabilities import ReplyStyle
+from musegadget.reachy_capabilities import CapabilityUnavailable, ReplyStyle
 from musegadget.reachy_companion_client import CompanionLink, CompanionNarrator, LinkState, parse_pin, parse_url
 from musegadget.reachy_companion_protocol import Narrate, Sender, decode
 
@@ -144,8 +144,20 @@ def test_a_progress_label_longer_than_the_wire_allows_is_cut_at_a_word():
     assert (sent.status, said.text) == (expected, expected)
 
 
-def test_a_reply_longer_than_the_wire_allows_is_cut_after_its_last_whole_sentence():
+def test_a_reply_longer_than_the_wire_allows_never_reaches_the_companion():
     reply = " ".join(f"Line {n:03d} is here." for n in range(600))
-    said, sent = narrated(lambda narrator: narrator.lines("castles", reply, ReplyStyle.PLAIN_SHORT))
-    assert (len(sent.reply), sent.reply[-17:]) == (8189, "Line 454 is here.")
-    assert [line.text for line in said] == ["Line 000 is here.", "Line 001 is here.", "Line 002 is here."]
+
+    async def run():
+        async with FakeCompanion() as companion:
+            link = CompanionLink(companion.url[:-3], token=TOKEN, insecure=True, out_rate=16000, backoff_s=(5, 5))
+            running = asyncio.ensure_future(link.run())
+            try:
+                await asyncio.wait_for(link.settled(), 5)
+                with pytest.raises(CapabilityUnavailable) as refused:
+                    await CompanionNarrator(link).lines("castles", reply, ReplyStyle.PLAIN_SHORT)
+            finally:
+                running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
+            sent = [decode(frame, sender=Sender.ROBOT) for frame in companion.received if isinstance(frame, str)]
+            return refused.value.link_down, [message for message in sent if isinstance(message, Narrate)]
+    assert asyncio.run(run()) == (False, [])

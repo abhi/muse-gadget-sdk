@@ -118,7 +118,9 @@ Then start with `--mode companion` and the usual `on-robot` flags.
 - Reachy still decides when you start talking. The companion decides when you
   are done, hears your words as you say them, and speaks the answer.
 - Muse is asked for one to three short, plain sentences. The companion turns
-  them into spoken lines with expressions.
+  them into spoken lines with expressions. A reply longer than 8192 bytes is
+  too long for the companion to condense, so Reachy speaks all of it in its
+  own voice.
 - Reachy checks each companion line against your request and Muse's reply. A
   line with a number or name that is in neither is dropped, and Reachy speaks
   Muse's own sentences instead. After three dropped or late lines in a row,

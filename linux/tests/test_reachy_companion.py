@@ -375,3 +375,21 @@ def test_a_companion_that_hears_nothing_mid_utterance_is_replaced_by_the_robot(m
             assert waited["s"] < 1
             assert [request.endswith(LOCAL_REQUEST) for request in robot.requests()] == [True]
     scenario(run())
+
+
+def test_a_reply_too_long_to_narrate_is_spoken_whole_by_the_robot_without_resting_the_narrator(monkeypatch):
+    walls = f"Castles kept {'very ' * 900}tall walls."
+    moats = f"Their moats were {'very ' * 900}deep."
+
+    async def muse(session, request):
+        await session.answer(request, f"{walls} {moats}" if request <= 3 else "Castles kept dragons out.")
+
+    async def run():
+        async with FakeCompanion(partials=PARTIALS, frames_per_partial=12) as companion:
+            robot = Conversation(monkeypatch, companion.url[:-3], muse)
+            await robot.run(lambda: robot.turns(4))
+            assert narrated_by_companion(companion) == ["acknowledge"] * 4 + ["lines"]
+            assert spoken_by_companion(companion) == [QUESTION] * 4 + ["Castles kept dragons out."]
+            assert [line for line in robot.spoken() if line != "companion"] == [f"tts:{walls}", f"tts:{moats}"] * 3
+            assert robot.notices() == []
+    scenario(run())

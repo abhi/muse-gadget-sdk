@@ -634,7 +634,9 @@ class CompanionNarrator:
                     message_id: Optional[str] = None) -> Tuple[SpokenLine, ...]:
         if style is not ReplyStyle.PLAIN_SHORT or not reply:
             raise CapabilityUnavailable("the companion condenses only plain replies", link_down=False)
-        lines = await self.link.narrate(NarrateOp.LINES, request, reply=_fit(reply, MAX_REPLY_BYTES, r"[.!?](?=\s|$)"))
+        if len(reply.encode("utf-8")) > MAX_REPLY_BYTES:
+            raise CapabilityUnavailable("the reply is too long for the companion to condense", link_down=False)
+        lines = await self.link.narrate(NarrateOp.LINES, request, reply=reply)
         return tuple(_spoken(line, "answer") for line in lines)
 
 

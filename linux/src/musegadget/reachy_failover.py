@@ -14,6 +14,7 @@ from typing import Optional, Tuple
 from musegadget.reachy_capabilities import (
     Backends, CapabilityUnavailable, HeardAudio, ReplyStyle, SpokenLine, grounded,
 )
+from musegadget.reachy_companion_protocol import MAX_REPLY_BYTES
 from musegadget.reachy_progress import ProgressPlan
 
 log = logging.getLogger(__name__)
@@ -302,6 +303,11 @@ class FailoverNarrator:
         local = await self.local.lines(request, reply, style, message_id=message_id)
         if style is ReplyStyle.PLAIN_SHORT and local and self._on_companion:
             spoken = " ".join(line.text for line in local)
+            if len(spoken.encode("utf-8")) > MAX_REPLY_BYTES:
+                log.info("Reachy speaks a %d-byte reply itself; the companion narrates at most %d",
+                         len(spoken.encode("utf-8")), MAX_REPLY_BYTES)
+                self.route.this_turn = False
+                return local
             result = await self._ask(self.companion.lines(request, spoken, style), LINES_DEADLINE_S,
                                      (request, spoken))
             if result:
