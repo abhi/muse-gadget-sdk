@@ -634,11 +634,11 @@ class VoiceConversation:
                     await close_job(job)
                     self._output_busy = False
                 if self._output_queue.empty() and not following.done():
+                    if self._wake_deadline is not None:
+                        self._wake_deadline = time.monotonic() + (self.wake_timeout_s or 10.0)
                     await self._plan(plan.OutputIdle(user_speaking=self._playback.user_speaking,
                                                      turn_open=self.tracker is not None,
                                                      wake_open=self._wake_deadline is not None))
-                    if self._wake_deadline is not None:
-                        self._wake_deadline = time.monotonic() + (self.wake_timeout_s or 10.0)
         finally:
             if not following.done():
                 following.cancel()

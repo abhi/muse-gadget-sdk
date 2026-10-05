@@ -2589,10 +2589,14 @@ def test_blank_first_wake_gives_local_cue_but_blank_followup_is_empty(monkeypatc
     asyncio.run(bounded(scenario()))
 
 
-def test_missing_asr_wake_boundary_opens_time_for_question_after_slow_recognition(monkeypatch):
+@pytest.mark.parametrize("echo_cancelled", [False, True])
+def test_missing_asr_wake_boundary_opens_time_for_question_after_slow_recognition(monkeypatch, echo_cancelled):
+    from types import SimpleNamespace
     np = pytest.importorskip("numpy")
     from musegadget import voice_audio
     monkeypatch.setattr(reachy_voice, "ECHO_TAIL_S", 0)
+    clock = [1000.0]
+    monkeypatch.setattr(reachy_voice, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     class Recorder:
         def finish_initial_capture(self):
             pass
@@ -2615,18 +2619,40 @@ def test_missing_asr_wake_boundary_opens_time_for_question_after_slow_recognitio
             return int(sample[0]) == 2
     class Recognition:
         async def transcribe(self, wav):
-            await asyncio.sleep(.06)
+            clock[0] += .06
             return "An uncertain transcript without the invocation."
     monkeypatch.setattr(voice_audio, "TurnRecorder", Recorder)
     async def scenario():
         session = FakeSession()
         session.chat_subscribed.set()
         hardware = FakeHardware()
+        hardware.echo_cancelled_input = echo_cancelled
+        play_audio, set_state = hardware.play_audio, hardware.set_state
+        recognition_window_opened = threading.Event()
+        def play_cue_longer_than_window(samples):
+            assert recognition_window_opened.wait(2)
+            play_audio(samples)
+            clock[0] += .05
+        def slow_pose_after_cue(state, **kwargs):
+            # Gives the microphone loop time to act while the speaker reports idle.
+            if hardware.played:
+                time.sleep(.05)
+            set_state(state, **kwargs)
+        hardware.play_audio, hardware.set_state = play_cue_longer_than_window, slow_pose_after_cue
         conversation = VoiceConversation(session, hardware,
                                          backends=backends_for(Mode.ON_ROBOT, session, speech=object(),
                                                                transcriber=Recognition()),
                                          wake_detector=Wake(), wake_timeout_s=.03)
         conversation.backends.voice.phrases["Yes?"] = (np.full(80, .1, dtype=np.float32),)
+        output_idle = asyncio.Event()
+        apply_plan = conversation._plan
+        async def observed_plan(event):
+            await apply_plan(event)
+            if isinstance(event, reachy_voice.plan.TurnDone):
+                recognition_window_opened.set()
+            if isinstance(event, reachy_voice.plan.OutputIdle):
+                output_idle.set()
+        conversation._plan = observed_plan
         microphone = asyncio.create_task(conversation._microphone())
         try:
             while not hardware.states:
@@ -2634,14 +2660,12 @@ def test_missing_asr_wake_boundary_opens_time_for_question_after_slow_recognitio
             hardware.samples.put(np.full(128, 2, dtype=np.float32))
             while hardware.states[-1] != "listening":
                 await asyncio.sleep(.001)
-            original_deadline = conversation._wake_deadline
+            assert conversation._wake_deadline == pytest.approx(1000.03)
             hardware.samples.put(np.ones(128, dtype=np.float32))
-            while conversation._wake_deadline <= original_deadline:
-                await asyncio.sleep(.001)
-            assert time.monotonic() > original_deadline
-            assert conversation._wake_deadline is not None
-            assert conversation._wake_deadline > time.monotonic()
-            assert hardware.states[-1] == "listening" and len(hardware.played) == 1
+            await output_idle.wait()
+            assert len(hardware.played) == 1
+            assert (clock[0], conversation._wake_deadline) == (pytest.approx(1000.11), pytest.approx(1000.14))
+            assert hardware.states[-1] == "listening"
             assert not session.setup_messages and not session.sent
         finally:
             await cancel_task(microphone)
