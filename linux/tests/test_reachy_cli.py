@@ -3,7 +3,10 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+import io
 import json
+import signal
+import stat
 import sys
 from types import SimpleNamespace
 import uuid
@@ -919,13 +922,13 @@ def test_missing_speech_gate_stops_before_capture_and_closes_prepared_resources(
 
 
 @pytest.mark.parametrize('argv, errors', [
-    (['--stt-model', 'whisper'], ['--stt-model needs --mode on-robot']),
+    (['--stt-model', 'whisper'], ['--stt-model needs --mode on-robot or companion']),
     (['--stt-model', 'whisper', '--tts-model', 'voice.onnx'],
-     ['--stt-model needs --mode on-robot', '--tts-model needs --mode on-robot']),
+     ['--stt-model needs --mode on-robot or companion', '--tts-model needs --mode on-robot or companion']),
     (['--mode', 'muse-voice', '--tts-model', 'voice.onnx', '--stream-replies'],
-     ['--tts-model needs --mode on-robot', '--stream-replies needs --mode on-robot']),
-    (['--stt-backend', 'moonshine'], ['--stt-backend needs --mode on-robot']),
-    (['--wake-model', 'keywords'], ['--wake-model needs --mode on-robot']),
+     ['--tts-model needs --mode on-robot or companion', '--stream-replies needs --mode on-robot or companion']),
+    (['--stt-backend', 'moonshine'], ['--stt-backend needs --mode on-robot or companion']),
+    (['--wake-model', 'keywords'], ['--wake-model needs --mode on-robot or companion']),
     (['--mode', 'on-robot'], ['--mode on-robot needs --stt-model', '--mode on-robot needs --tts-model']),
     (['--mode', 'on-robot', '--stt-model', 'whisper', '--wake-model', 'keywords'],
      ['--mode on-robot needs --tts-model']),
@@ -938,11 +941,54 @@ def test_each_mode_rejects_missing_and_foreign_flags_before_anything_starts(
     assert capsys.readouterr().err == ''.join(f'Reachy: {error}\n' for error in errors)
 
 
-def test_companion_mode_is_not_offered_yet(capsys):
-    with pytest.raises(SystemExit) as raised:
-        reachy_cli.main(['run', '--mode', 'companion'])
-    assert raised.value.code == 2
-    assert "argument --mode: invalid choice: 'companion'" in capsys.readouterr().err
+def test_companion_mode_needs_the_on_robot_models_and_a_saved_companion(tmp_path, monkeypatch, capsys):
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--mode', 'companion']) == 2
+    assert capsys.readouterr().err == ('Reachy: --mode companion needs --stt-model\n'
+                                       'Reachy: --mode companion needs --tts-model\n')
+    monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: pytest.fail('hardware started without a companion'))
+    (tmp_path / config.PAIRING_FILE).write_text('{"paired": true}')
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--mode', 'companion',
+                            '--stt-model', 'whisper', '--tts-model', 'voice.onnx']) == 1
+    assert capsys.readouterr().err == ('Reachy: --mode companion needs a companion; '
+                                       'run `muse-reachy companion add` first\n')
+
+
+def test_companion_add_saves_url_pin_and_token_for_the_owner_only_and_remove_forgets_them(tmp_path, capsys):
+    pin = 'sha256:' + '4f' * 32
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'companion', 'add', 'wss://studio.local:8765',
+                            '--pin', pin, '--token', 'rc1_secret']) == 0
+    saved = tmp_path / config.COMPANION_FILE
+    assert json.loads(saved.read_text()) == {'url': 'wss://studio.local:8765', 'pin': pin, 'token': 'rc1_secret'}
+    assert stat.S_IMODE(saved.stat().st_mode) == 0o600
+    assert capsys.readouterr().out == 'Reachy saved its companion at wss://studio.local:8765.\n'
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'companion', 'remove']) == 0
+    assert not saved.exists()
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'companion', 'status']) == 1
+    assert capsys.readouterr().out == ('Reachy forgot its companion.\n'
+                                       'Reachy has no companion. Run `muse-reachy companion add` first.\n')
+
+
+def test_companion_add_reads_the_token_from_stdin_when_it_is_not_an_argument(tmp_path, monkeypatch, capsys):
+    pin = 'sha256:' + '4f' * 32
+    monkeypatch.setattr(sys, 'stdin', io.StringIO('rc1_secret\n'))
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'companion', 'add', 'wss://studio.local:8765',
+                            '--pin', pin]) == 0
+    saved = json.loads((tmp_path / config.COMPANION_FILE).read_text())
+    assert saved == {'url': 'wss://studio.local:8765', 'pin': pin, 'token': 'rc1_secret'}
+    assert capsys.readouterr().out == 'Reachy saved its companion at wss://studio.local:8765.\n'
+
+
+@pytest.mark.parametrize('url, pin, token, error', [
+    ('ws://studio.local:8765', 'sha256:' + '4f' * 32, 'rc1_secret', 'must use wss://'),
+    ('wss://studio.local:8765/v1', 'sha256:' + '4f' * 32, 'rc1_secret', 'must look like wss://HOST:PORT'),
+    ('wss://studio.local:8765', 'sha256:4f', 'rc1_secret', 'pin must be sha256:'),
+    ('wss://studio.local:8765', 'sha256:' + '4f' * 32, 'rc1 secret', 'token must be 1 to 128 bytes'),
+])
+def test_companion_add_refuses_what_the_link_could_not_use(tmp_path, capsys, url, pin, token, error):
+    assert reachy_cli.main(['--state-dir', str(tmp_path), 'companion', 'add', url, '--pin', pin,
+                            '--token', token]) == 1
+    assert error in capsys.readouterr().err
+    assert not (tmp_path / config.COMPANION_FILE).exists()
 
 
 @pytest.mark.parametrize('argv, style, voice', [
@@ -952,6 +998,8 @@ def test_companion_mode_is_not_offered_yet(capsys):
      ReplyStyle.MARKER, 'LocalVoice'),
     (['--mode', 'on-robot', '--stt-model', 'whisper', '--tts-model', 'voice.onnx', '--stream-replies'],
      ReplyStyle.EXPRESSIVE_JSON, 'LocalVoice'),
+    (['--mode', 'companion', '--stt-model', 'whisper', '--tts-model', 'voice.onnx'],
+     ReplyStyle.MARKER, 'FailoverVoice'),
 ])
 def test_each_mode_starts_the_conversation_with_its_reply_style_and_voice(tmp_path, monkeypatch, argv, style, voice):
     from musegadget.identity import Identity
@@ -959,8 +1007,10 @@ def test_each_mode_starts_the_conversation_with_its_reply_style_and_voice(tmp_pa
     captured = {}
 
     class Hardware:
+        output_sample_rate = 16000
+
         def start(self):
-            pass
+            captured['sigterm_while_starting'] = signal.getsignal(signal.SIGTERM)
 
         def close(self):
             pass
@@ -982,8 +1032,10 @@ def test_each_mode_starts_the_conversation_with_its_reply_style_and_voice(tmp_pa
         async def run(self):
             pass
 
+    companion = {'url': 'wss://127.0.0.1:9', 'pin': 'sha256:' + '4f' * 32, 'token': 'rc1_secret'}
     monkeypatch.delenv(config.SDK_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(config, 'load_json', lambda *args: {'paired': True})
+    monkeypatch.setattr(config, 'load_json',
+                        lambda name, *args: companion if name == config.COMPANION_FILE else {'paired': True})
     monkeypatch.setattr(reachy_cli.identity, 'load_or_create', lambda: Identity('02:00:00:ab:cd:ef'))
     monkeypatch.setattr(reachy_cli, '_hardware', lambda *args: Hardware())
     monkeypatch.setattr('musegadget.local_speech.PiperSpeech', lambda model: Model())
@@ -993,3 +1045,5 @@ def test_each_mode_starts_the_conversation_with_its_reply_style_and_voice(tmp_pa
     assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', *argv]) == 0
     backends = captured['backends'](object())
     assert (backends.reply_style(), type(backends.voice).__name__) == (style, voice)
+    # A stop request while the robot starts ends the run cleanly instead of killing the process.
+    assert captured['sigterm_while_starting'] is not signal.SIG_DFL

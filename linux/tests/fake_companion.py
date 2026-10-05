@@ -1,3 +1,22 @@
+"""An in-process companion speaking wire protocol v1 over plain ws://, for tests.
+
+Scripted hearing, a deterministic tone for speech, an echo narrator, and fault knobs:
+- abort_after_frames_both_ways_since_welcome=N: abort the TCP connection, with no close
+  frame, once N frames have crossed it after `welcome`, counting both directions.
+- stall: after `welcome`, never answer anything again (transport pings still work).
+- fabricate: append " It took 17 minutes." to the first narrated line.
+- gap: never send speech seq 1, so the robot sees 0, 2, 3, ...
+- expression: the expression attached to every narrated line.
+- drop_mid_speech: abort the TCP connection right after the first speech frame, once.
+- fail_after_welcome: send error{internal} right after every `welcome`, which ends the session.
+- mute: never answer speak_start, with audio or speak_done.
+- no_endpoint: never send hear_endpoint, even for a stream the robot closed with finish.
+- port: listen on this port instead of a free one, so a test can start the companion late.
+- ssl: serve wss:// with this server context.
+
+`hellos` records every hello token the fake was sent, accepted or not.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +28,9 @@ from typing import Dict, Optional, Tuple
 
 from websockets.asyncio.server import serve
 
+from musegadget.reachy_capabilities import Expression
 from musegadget.reachy_companion_protocol import (
+    MAX_ERROR_MESSAGE_BYTES,
     MAX_LINE_BYTES,
     VERSION,
     AudioKind,
@@ -61,6 +82,13 @@ class FakeCompanion:
         stall: bool = False,
         fabricate: bool = False,
         gap: bool = False,
+        expression: Optional[Expression] = None,
+        drop_mid_speech: bool = False,
+        fail_after_welcome: bool = False,
+        mute: bool = False,
+        no_endpoint: bool = False,
+        port: int = 0,
+        ssl=None,
     ) -> None:
         self.token = token
         self.ops = ops
@@ -72,6 +100,14 @@ class FakeCompanion:
         self.stall = stall
         self.fabricate = fabricate
         self.gap = gap
+        self.expression = expression
+        self.drop_mid_speech = drop_mid_speech
+        self.fail_after_welcome = fail_after_welcome
+        self.mute = mute
+        self.no_endpoint = no_endpoint
+        self.port = port
+        self.ssl = ssl
+        self.hellos = []
         self.received = []
         self.url = ""
 
@@ -82,9 +118,9 @@ class FakeCompanion:
         return struct.pack(f"<{count}h", *(int(8000 * math.sin(2 * math.pi * 440 * (start + n) / rate)) for n in range(count)))
 
     async def __aenter__(self) -> FakeCompanion:
-        self._server = await serve(self._session, "127.0.0.1", 0)
+        self._server = await serve(self._session, "127.0.0.1", self.port, ssl=self.ssl)
         port = self._server.sockets[0].getsockname()[1]
-        self.url = f"ws://127.0.0.1:{port}/v1"
+        self.url = f"{'wss' if self.ssl else 'ws'}://127.0.0.1:{port}/v1"
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -129,6 +165,8 @@ class _Session:
             hello = decode(first, sender=Sender.ROBOT) if isinstance(first, str) else None
         except ProtocolError:
             hello = None
+        if isinstance(hello, Hello):
+            self.fake.hellos.append(hello.token)
         if not isinstance(hello, Hello) or not hmac.compare_digest(hello.token.encode(), self.fake.token.encode()):
             await self.ws.send(encode(Error(ErrorCode.AUTH, "bad token")))
             return
@@ -138,6 +176,9 @@ class _Session:
         self.out_rate = hello.out_rate
         ops = tuple(op for op in hello.ops if op in self.fake.ops)
         await self.ws.send(encode(Welcome(VERSION, ops, tuple(m for m in MODELS if Op(m[0]) in ops))))
+        if self.fake.fail_after_welcome:
+            await self.ws.send(encode(Error(ErrorCode.INTERNAL, "the model crashed")))
+            return
         self.crossed = 0
         try:
             async for frame in self.ws:
@@ -149,7 +190,7 @@ class _Session:
                     else:
                         await self._message(decode(frame, sender=Sender.ROBOT))
                 except ProtocolError as error:
-                    await self.send(Error(error.code, str(error)))
+                    await self.send(Error(error.code, _clip(str(error), MAX_ERROR_MESSAGE_BYTES)))
         finally:
             for task in self.speaking.values():
                 task.cancel()
@@ -162,7 +203,7 @@ class _Session:
         if heard % self.fake.frames_per_partial == 0 and heard // self.fake.frames_per_partial <= len(self.fake.partials):
             rev = heard // self.fake.frames_per_partial - 1
             await self.send(HearPartial(audio.stream, rev, self.fake.partials[rev]))
-        if heard == self.fake.endpoint_after:
+        if heard == self.fake.endpoint_after and not self.fake.no_endpoint:
             del self.hearing[audio.stream]
             await self.send(HearEndpoint(audio.stream, self.fake.partials[-1], False))
 
@@ -170,9 +211,10 @@ class _Session:
         if isinstance(message, HearOpen):
             self.hearing[message.stream] = 0
         elif isinstance(message, HearClose):
-            if self.hearing.pop(message.stream, None) is not None and message.how is CloseHow.FINISH:
+            if (self.hearing.pop(message.stream, None) is not None and message.how is CloseHow.FINISH
+                    and not self.fake.no_endpoint):
                 await self.send(HearEndpoint(message.stream, self.fake.partials[-1], True))
-        elif isinstance(message, SpeakStart):
+        elif isinstance(message, SpeakStart) and not self.fake.mute:
             self.speaking[message.stream] = asyncio.ensure_future(self._speak(message.stream))
         elif isinstance(message, SpeakCancel):
             task = self.speaking.pop(message.stream, None)
@@ -191,6 +233,9 @@ class _Session:
                     continue
                 await self.send(encode_audio(AudioKind.SPEECH, stream, seq, FakeCompanion.tone(self.out_rate, seq)))
                 self.sent[stream] += 1
+                if self.fake.drop_mid_speech:
+                    self.fake.drop_mid_speech = False
+                    raise _Dropped
                 await asyncio.sleep(0)
             del self.speaking[stream]
             await self.send(SpeakDone(stream, self.sent[stream]))
@@ -206,8 +251,8 @@ class _Session:
         sentences = [s for s in re.split(r"(?<=[.!?])\s+", source.strip()) if s][:3]
         if self.fake.fabricate and sentences:
             sentences[0] += FABRICATION
-        return tuple(NarratedLine(_clip(s), None) for s in sentences)
+        return tuple(NarratedLine(_clip(s), self.fake.expression) for s in sentences)
 
 
-def _clip(text: str) -> str:
-    return text.encode("utf-8")[:MAX_LINE_BYTES].decode("utf-8", "ignore")
+def _clip(text: str, limit: int = MAX_LINE_BYTES) -> str:
+    return text.encode("utf-8")[:limit].decode("utf-8", "ignore")

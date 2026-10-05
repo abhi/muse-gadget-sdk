@@ -782,6 +782,10 @@ class VoiceConversation:
             self._closing_speech.add(closing)
             closing.add_done_callback(self._closing_speech.discard)
 
+    def _notice_fits(self, recorder) -> bool:
+        """Whether a notice can be spoken now: the speaker queue has room and the user is not talking."""
+        return not self._output_queue.full() and not recorder.active and not self._playback.user_speaking
+
     async def _microphone(self) -> None:
         hearing = self.backends.hearing
         await self.session.chat_subscribed.wait()
@@ -943,7 +947,7 @@ class VoiceConversation:
                 if speaker.done():
                     speaker.result()
                     raise ConnectionError("Reachy speaker ended")
-                notice = self.backends.take_notice() if not self._output_queue.full() else None
+                notice = self.backends.take_notice() if self._notice_fits(recorder) else None
                 if notice is not None:
                     log.warning("Reachy's companion stopped answering; using on-robot speech")
                     self._output_queue.put_nowait(_SpeechJob(None, notice, state="listening"))

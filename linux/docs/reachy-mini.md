@@ -83,10 +83,60 @@ sudo chown -R pollen:pollen /home/pollen/.local/share/musegadget-reachy
   [Muse response compatibility](#muse-response-compatibility).
 - `on-robot` keeps speech on the robot. Whisper turns your words into text, and
   Piper speaks Muse's answer. This mode needs `--stt-model` and `--tts-model`.
-  `--stream-replies` and wake-word invocation work only in this mode.
+- `companion` lets a paired computer on your network hear, speak and narrate.
+  It needs the same flags as `on-robot`, because those models take over when the
+  companion stops answering. See [Companion mode](#companion-mode).
 
+`--stream-replies` and wake-word invocation need `on-robot` or `companion`.
 Reachy checks the flags before it starts. A flag that does not fit the mode
-stops startup with a message such as `--stt-model needs --mode on-robot`.
+stops startup with a message such as
+`--stt-model needs --mode on-robot or companion`.
+
+## Companion mode
+
+A companion is a computer on your network, such as a Mac, that runs the
+companion server. The server lives in its own repository. This SDK holds the
+robot's side: the client, the wire protocol and its test vectors.
+
+Pair once. The companion's `pair` command prints its address, certificate pin
+and token. Save them on the robot:
+
+```sh
+~/muse-reachy-venv/bin/muse-reachy companion add wss://studio.local:8765 --pin sha256:4f...
+~/muse-reachy-venv/bin/muse-reachy companion status
+```
+
+`companion add` asks for the token. Scripts can pipe it to standard input or
+pass `--token`, but a token on the command line stays in shell history and the
+process list.
+
+Reachy stores them in `companion.json` in its state directory, readable only by
+its owner. `companion remove` forgets them.
+
+Then start with `--mode companion` and the usual `on-robot` flags.
+
+- Reachy still decides when you start talking. The companion decides when you
+  are done, hears your words as you say them, and speaks the answer.
+- Muse is asked for one to three short, plain sentences. The companion turns
+  them into spoken lines with expressions.
+- Reachy checks each companion line against your request and Muse's reply. A
+  line with a number or name that is in neither is dropped, and Reachy speaks
+  Muse's own sentences instead. After three dropped or late lines in a row,
+  Reachy narrates on its own for a minute, while the companion keeps hearing and
+  speaking. Companion speech that stalls three times in a row rests the same way.
+- Only audio from a listening window, your request, public status labels and
+  Muse's reply text go to the companion. Muse session IDs, message IDs and
+  credentials never do.
+
+The connection is TLS, pinned to the companion's certificate, with the pairing
+token. If the companion stops answering, Reachy says once: "My companion
+computer isn't answering, so I'll use my own voice for now." It finishes the
+current turn with its own models, from the audio it already heard. It does the
+same, without the notice, for a turn the companion stops transcribing or does
+not end within 3 seconds of your last word. When the
+companion has been back for 10 seconds, Reachy uses it again from the next turn.
+A companion that keeps dropping right after it connects is announced once, not
+on every reconnect.
 
 ## Check and start
 

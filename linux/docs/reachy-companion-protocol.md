@@ -11,9 +11,11 @@ A companion implementation must pass every vector.
 ## Transport
 
 - The robot opens one WebSocket to `wss://HOST:8765/v1`. The robot is the client.
+- Pairing stores the base address, `wss://HOST:8765`. The robot adds `/v1`.
+- The pin is `sha256:` and 64 lowercase hex digits, the digest of the certificate in DER form.
 - TLS is pinned. The robot accepts only the companion's self-signed certificate whose SHA-256 fingerprint it stored at pairing. It does not use a certificate authority.
 - The pairing token is 32 random bytes. The robot sends it in `hello`. The companion compares it in constant time.
-- Plain `ws://` is for tests only. The robot allows it only with `--companion-insecure`.
+- Plain `ws://` is for tests only. The robot's client allows it only when a test passes `insecure=True`.
 - Both sides send a WebSocket ping every 2 s. A peer that does not answer within 3 s is gone.
 
 ## Framing

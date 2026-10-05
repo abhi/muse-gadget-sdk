@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
-import functools
+import getpass
 import hashlib
 import json
 import logging
@@ -285,6 +285,8 @@ MODE_FLAGS = {
     Mode.MUSE_VOICE: ModeFlags(forbids=("--stt-model", "--stt-backend", "--tts-model",
                                         "--stream-replies", "--wake-model")),
     Mode.ON_ROBOT: ModeFlags(requires=("--stt-model", "--tts-model")),
+    # The on-robot models answer whenever the companion can't.
+    Mode.COMPANION: ModeFlags(requires=("--stt-model", "--tts-model")),
 }
 
 
@@ -328,7 +330,9 @@ def parser() -> argparse.ArgumentParser:
             item.add_argument("--mode", choices=tuple(mode.value for mode in MODE_FLAGS),
                               default=Mode.MUSE_VOICE.value,
                               help="muse-voice: Muse hears and speaks (default). "
-                                   "on-robot: Reachy's own speech models; needs --stt-model and --tts-model")
+                                   "on-robot: Reachy's own speech models; needs --stt-model and --tts-model. "
+                                   "companion: a paired computer hears and speaks, with the on-robot "
+                                   "models as fallback; needs `companion add` first")
             item.add_argument("--face-follow", action="store_true",
                               help="Follow a nearby face locally during conversations; camera frames stay on the robot")
             item.add_argument("--face-follow-model", type=Path,
@@ -358,7 +362,70 @@ def parser() -> argparse.ArgumentParser:
         else:
             item.add_argument("--exercise", action="store_true",
                               help="Capture microphone audio, play a tone, and exercise motion")
+    companion = sub.add_parser("companion", help="Pair Reachy with a companion computer for --mode companion")
+    actions = companion.add_subparsers(dest="companion_command", required=True)
+    add = actions.add_parser("add", help="Save the address, pin and token that `reachy-companion pair` printed")
+    add.add_argument("url", help="wss://HOST:PORT")
+    add.add_argument("--pin", required=True, help="sha256: and the certificate's 64 hex digits")
+    add.add_argument("--token", help="the pairing token; without it, Reachy reads the token from standard input. "
+                                     "On the command line it stays in shell history and the process list")
+    actions.add_parser("remove", help="Forget the companion")
+    actions.add_parser("status", help="Show the saved companion and check that it answers")
     return p
+
+
+def companion_command(args) -> int:
+    from musegadget.reachy_companion_client import parse_pin, parse_url
+
+    if args.companion_command == "add":
+        if args.token is not None:
+            token = args.token.strip()
+        elif sys.stdin.isatty():
+            token = getpass.getpass("Companion token: ").strip()
+        else:
+            token = sys.stdin.readline().strip()
+        if not token or len(token.encode("utf-8")) > 128 or any(char.isspace() for char in token):
+            raise ValueError("the companion token must be 1 to 128 bytes with no spaces")
+        parse_pin(args.pin)
+        url = parse_url(args.url)
+        config.save_json(config.COMPANION_FILE, {"url": url, "pin": args.pin, "token": token})
+        print(f"Reachy saved its companion at {url}.")
+        return 0
+    if args.companion_command == "remove":
+        config.delete_json(config.COMPANION_FILE)
+        print("Reachy forgot its companion.")
+        return 0
+    saved = saved_companion()
+    if saved is None:
+        print("Reachy has no companion. Run `muse-reachy companion add` first.")
+        return 1
+    state, models = asyncio.run(_probe(saved))
+    print(f"Companion {saved['url']}, pin {saved['pin']}")
+    if state != "up":
+        print("The companion is not answering.")
+        return 1
+    print("The companion answers: " + (", ".join(f"{op} {model}" for op, model in models) or "no models"))
+    return 0
+
+
+def saved_companion() -> dict | None:
+    saved = config.load_json(config.COMPANION_FILE)
+    if saved is None or not all(isinstance(saved.get(key), str) for key in ("url", "pin", "token")):
+        return None
+    return saved
+
+
+async def _probe(saved: dict):
+    from musegadget.reachy_companion_client import CompanionLink
+
+    link = CompanionLink.from_config(saved, out_rate=16000)
+    running = asyncio.ensure_future(link.run())
+    try:
+        await asyncio.wait_for(link.settled(), 10)
+        return link.state.value, link.models
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
 
 
 def _hardware(args, *, motion=True):
@@ -394,6 +461,11 @@ async def run(args) -> int:
         raise ValueError("--wake-backend vosk requires --wake-model")
     if not math.isfinite(args.wake_timeout) or not 1 <= args.wake_timeout <= 300:
         raise ValueError("--wake-timeout must be between 1 and 300 seconds")
+    companion = None
+    if Mode(args.mode) is Mode.COMPANION:
+        companion = saved_companion()
+        if companion is None:
+            raise ValueError("--mode companion needs a companion; run `muse-reachy companion add` first")
     ident = identity.load_or_create()
     session_id = None if args.main_chat else args.session_id
     robot = _hardware(args)
@@ -414,6 +486,7 @@ async def run(args) -> int:
     transcriber = None
     wake_detector = None
     speech_gate = None
+    link_task = None
     try:
         if args.tts_model is not None:
             from musegadget.local_speech import PiperSpeech
@@ -443,22 +516,28 @@ async def run(args) -> int:
                                                    phrase=args.wake_phrase)
             if getattr(wake_detector, "timing_supported", False):
                 logging.getLogger(__name__).info("Reachy timed wake handoff ready")
+        link = None
+
+        def backends(session):
+            return backends_for(Mode(args.mode), session, speech=speech, progress_speech=progress_speech,
+                                transcriber=transcriber, stream_replies=args.stream_replies,
+                                wake=wake_detector is not None, companion=link)
         service = ReachyService(identity=ident, executor=robot, sdk_token=config.sdk_token(),
                                display_name="Reachy Mini", session_id=session_id,
                                prepare_chat=dedicated_chat.prepare if dedicated_chat else None,
                                owns_chat=dedicated_chat is not None,
-                               silence_s=args.silence,
-                               backends=functools.partial(backends_for, Mode(args.mode), speech=speech,
-                                                          progress_speech=progress_speech,
-                                                          transcriber=transcriber,
-                                                          stream_replies=args.stream_replies,
-                                                          wake=wake_detector is not None),
+                               silence_s=args.silence, backends=backends,
                                audio_diagnostics=args.audio_diagnostics, wake_detector=wake_detector,
                                wake_timeout_s=args.wake_timeout, speech_gate=speech_gate)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, service.stop)
         await asyncio.to_thread(robot.start)
+        if companion is not None:
+            from musegadget.reachy_companion_client import CompanionLink
+            # The companion speaks at the speaker's rate, which Reachy knows only once it has started.
+            link = CompanionLink.from_config(companion, out_rate=robot.output_sample_rate)
+            link_task = asyncio.ensure_future(link.run())
         if speech is not None:
             await asyncio.wait_for(speech.start(), 30)
         if progress_speech is not None:
@@ -469,6 +548,9 @@ async def run(args) -> int:
                                          "Reachy's dedicated side chat" if dedicated_chat else session_id or "main")
         await service.run()
     finally:
+        if link_task is not None:
+            link_task.cancel()
+            await asyncio.gather(link_task, return_exceptions=True)
         try:
             await asyncio.to_thread(robot.close)
         finally:
@@ -565,6 +647,8 @@ def main(argv=None) -> int:
             return cmd_pair(args)
         if args.command == "doctor":
             return doctor(args)
+        if args.command == "companion":
+            return companion_command(args)
         return asyncio.run(run(args))
     except KeyboardInterrupt:
         return 130

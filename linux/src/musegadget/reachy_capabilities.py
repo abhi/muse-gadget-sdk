@@ -168,9 +168,8 @@ class CapabilityUnavailable(Exception):
 
 
 class LinkHealth(Protocol):
-    up: bool                       # the companion answered welcome and can condense replies
-
-    def take_outage(self) -> bool: ...   # True once for each outage, on its up-to-down transition
+    def begin_turn(self) -> bool: ...    # True: the companion voices and narrates the turn starting now
+    def take_outage(self) -> bool: ...   # True once for each outage worth announcing
 
 
 COMPANION_NOTICE = "My companion computer isn't answering, so I'll use my own voice for now."
@@ -187,7 +186,7 @@ class Backends:
 
     def reply_style(self) -> ReplyStyle:
         """The style for the next request; read once per turn, at its boundary."""
-        if self.companion is not None and self.companion.up:
+        if self.companion is not None and self.companion.begin_turn():
             return ReplyStyle.PLAIN_SHORT
         return self.local_style
 

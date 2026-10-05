@@ -27,6 +27,7 @@ DEFAULT_SOCKET = Path("/run/musegadget/musegadget.sock")
 DEFAULT_STATE_DIR = Path("/var/lib/musegadget")
 IDENTITY_FILE = "identity.json"
 PAIRING_FILE = "pairing.json"
+COMPANION_FILE = "companion.json"
 SDK_TOKEN_ENV = "MUSEGADGET_SDK_TOKEN"
 SDK_TOKEN_FILE = "sdk_token"
 # mgst_ plus 43 canonical base64url characters, as issued by gadgets.muse.ai.

@@ -319,7 +319,12 @@ def split_sentences(text: str) -> Tuple[str, ...]:
 
 
 def backends_for(mode: Mode, session, *, speech=None, progress_speech=None, transcriber=None,
-                 stream_replies: bool = False, wake: bool = False) -> Backends:
+                 stream_replies: bool = False, wake: bool = False, companion=None) -> Backends:
+    if mode is Mode.COMPANION:
+        from musegadget.reachy_failover import companion_backends
+        local = backends_for(Mode.ON_ROBOT, session, speech=speech, progress_speech=progress_speech,
+                             transcriber=transcriber, stream_replies=stream_replies, wake=wake)
+        return companion_backends(local, companion)
     if mode is Mode.MUSE_VOICE:
         return Backends(hearing=LocalHearing(), voice=MuseVoice(session), narrator=RuleNarrator(),
                         local_style=ReplyStyle.MUSE_VOICE)
