@@ -38,8 +38,10 @@ import logging
 import struct
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Callable, Sequence
 from urllib.parse import quote
 
 from musegadget.muse_api import user_agent
@@ -57,6 +59,10 @@ HANDSHAKE_TIMEOUT_S = 20
 PING_INTERVAL_S = 20
 MAX_CONCURRENT_INVOKES = 4
 MAX_INBOUND_MESSAGE = 4 * 1024 * 1024
+MAX_CHAT_EVENT_BYTES = 256 * 1024
+MAX_STREAM_BUFFER_BYTES = 1024 * 1024
+MAX_TTS_BUFFER_BYTES = 8 * 1024 * 1024
+STREAM_CHUNK_BYTES = 16 * 1024
 MAX_VOICE_BYTES = 2 * 1024 * 1024
 REQUEST_CHUNK_BYTES = 16 * 1024
 MAX_INLINE_REQUEST_BYTES = 64 * 1024
@@ -155,12 +161,15 @@ class LinkSession:
         self._stream_id = 0
         self._register_id = ""
         self._requests: dict[int, _Request] = {}
+        self._streams: dict[int, HttpStream] = {}
         self._running = False
         self.registered = asyncio.Event()
+        self.chat_subscribed = asyncio.Event()
         self.registered_at: float | None = None
 
     async def run(self, stop: asyncio.Event) -> Outcome:
         self.registered.clear()
+        self.chat_subscribed.clear()
         try:
             ws = await self._open()
         except _UpgradeRejected as rejected:
@@ -183,6 +192,7 @@ class LinkSession:
         finally:
             self._running = False
             self.registered.clear()
+            self.chat_subscribed.clear()
             background = []
             for pending in (reader, stopper):
                 if pending is not None:
@@ -195,6 +205,9 @@ class LinkSession:
                 if not request.done.done():
                     request.done.set_exception(ConnectionError("session ended"))
             self._requests.clear()
+            for stream in self._streams.values():
+                stream.fail(ConnectionError("session ended"))
+            self._streams.clear()
             # Closing the socket wakes writers stalled by network backpressure.
             await ws.close()
             if background:
@@ -266,7 +279,7 @@ class LinkSession:
         commands back here. ``session_id`` targets a side chat; an id the Muse
         has not seen before starts a new one. Without it the message goes to
         the main chat. Pass ``output_modality="voice"`` to get a reply that
-        Muse can speak.
+        ``stream_tts`` can speak.
         """
         request_body = {
             "message": message,
@@ -346,6 +359,92 @@ class LinkSession:
             decoded = response.decode("utf-8", errors="replace")[:2000]
         return {"ok": 200 <= status < 300, "status": status, "response": decoded}
 
+    @asynccontextmanager
+    async def stream_http(
+        self, method: str, path: str, body: bytes = b"", *, headers: Sequence[Header] = (),
+        max_buffer_bytes: int = MAX_STREAM_BUFFER_BYTES,
+    ) -> AsyncIterator[HttpStream]:
+        """Open a bounded HTTP response stream; closing it cancels its request.
+
+        The response status and headers are available on entry. Consumers
+        iterate byte chunks without holding up the control stream. Pending
+        chunks coalesce into 16 KiB buffers. A consumer that exceeds its byte
+        budget fails independently; the default budget is 1 MiB.
+        """
+        if not self._running:
+            raise ConnectionError("Muse session is not connected")
+        encrypted = self._transport.encrypt_http_request(
+            method, path, body, headers=self._http_headers(headers),
+        )
+        stream = HttpStream(max_buffer_bytes)
+        self._streams[encrypted.stream_id] = stream
+        try:
+            await self._send_frames(encrypted.frames)
+            await asyncio.wait_for(stream.ready, REQUEST_TIMEOUT_S)
+            yield stream
+        finally:
+            self._streams.pop(encrypted.stream_id, None)
+            if not stream.ended and not stream.reset_requested:
+                stream.reset_requested = True
+                await self._reset_stream(encrypted.stream_id)
+            stream.close()
+
+    async def subscribe_chat(self, session_id: str | None = None) -> AsyncIterator[dict]:
+        """Yield Muse chat events from its NDJSON subscription."""
+        body = json.dumps({"session_id": session_id} if session_id else {}).encode()
+        path = "/chat/subscribe"
+        async with self.stream_http("POST", path, body, headers=[
+            Header("Content-Type", "application/json"), Header("Accept", "application/x-ndjson"),
+        ]) as stream:
+            if not 200 <= stream.status < 300:
+                raise HttpStreamError(stream.status, path)
+            self.chat_subscribed.set()
+            try:
+                buffered = bytearray()
+                async for chunk in stream:
+                    for part in chunk.splitlines(keepends=True):
+                        buffered += part
+                        if len(buffered) > MAX_CHAT_EVENT_BYTES:
+                            raise ValueError("Muse chat event exceeds 256 KiB")
+                        if not buffered.endswith(b"\n"):
+                            continue
+                        event = self._chat_event(bytes(buffered))
+                        buffered.clear()
+                        if event is not None:
+                            yield event
+                if buffered:
+                    event = self._chat_event(bytes(buffered))
+                    if event is not None:
+                        yield event
+            finally:
+                self.chat_subscribed.clear()
+
+    @staticmethod
+    def _chat_event(raw: bytes) -> dict | None:
+        if not raw.strip():
+            return None
+        try:
+            event = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            log.warning("dropping malformed chat event (%d bytes)", len(raw))
+            return None
+        return event if isinstance(event, dict) and event.get("type") == "event" else None
+
+    async def stream_tts(self, message_id: str) -> AsyncIterator[bytes]:
+        """Yield MP3 for a voice-modality assistant reply, with the legacy fallback."""
+        encoded_id = quote(message_id, safe=_URI_COMPONENT_SAFE)
+        for prefix in ("/api/voice/tts-stream", "/voice/tts-stream"):
+            path = f"{prefix}?message_id={encoded_id}"
+            async with self.stream_http("GET", path, headers=[Header("Accept", "audio/mpeg")],
+                                        max_buffer_bytes=MAX_TTS_BUFFER_BYTES) as stream:
+                if stream.status == 404 and prefix == "/api/voice/tts-stream":
+                    continue
+                if not 200 <= stream.status < 300:
+                    raise HttpStreamError(stream.status, prefix)
+                async for chunk in stream:
+                    yield chunk
+                return
+
     async def _reset_stream(self, stream_id: int) -> None:
         if not self._running:
             return
@@ -404,7 +503,15 @@ class LinkSession:
             if frame is None:
                 continue
             if frame.stream_id != self._stream_id:
-                self._requests.get(frame.stream_id, _NO_REQUEST).on_frame(frame)
+                stream = self._streams.get(frame.stream_id)
+                if stream is not None:
+                    if not stream.on_frame(frame):
+                        stream.reset_requested = True
+                        task = asyncio.ensure_future(self._reset_stream(frame.stream_id))
+                        self._tasks.add(task)
+                        task.add_done_callback(self._tasks.discard)
+                else:
+                    self._requests.get(frame.stream_id, _NO_REQUEST).on_frame(frame)
                 continue
             if frame.kind == "reset":
                 log.warning("control stream reset: %s", frame.value.reason)
@@ -478,6 +585,107 @@ def describe_result(result: dict) -> str:
         timed_out = ", timed out" if payload.get("timed_out") else ""
         return f"ok, exit {payload['exit_code']}{timed_out}"
     return "ok"
+
+
+class HttpStreamError(ConnectionError):
+    """Muse refused an HTTP request carried by the Noise session."""
+
+    def __init__(self, status: int, path: str) -> None:
+        super().__init__(f"Muse request {path} failed: HTTP {status}")
+        self.status = status
+        self.path = path
+
+
+class HttpStream:
+    """Response headers and bounded byte chunks dispatched by the reader."""
+
+    def __init__(self, max_buffer_bytes: int = MAX_STREAM_BUFFER_BYTES) -> None:
+        self.ready = asyncio.get_running_loop().create_future()
+        self.status = 0
+        self.headers: list[Header] = []
+        self.ended = False
+        self.reset_requested = False
+        self._finished = False
+        self._chunks: deque[bytearray] = deque()
+        self._available = asyncio.Event()
+        self._error: Exception | None = None
+        self._buffered = 0
+        self._max_buffer_bytes = max_buffer_bytes
+
+    def on_frame(self, frame) -> bool:
+        if self._finished:
+            return True
+        if frame.kind == "reset":
+            self.ended = True
+            self.fail(ConnectionError("Muse response stream reset"))
+            return True
+        if frame.kind == "response":
+            self.status = frame.value.status
+            self.headers = list(frame.value.headers)
+            if not self.ready.done():
+                self.ready.set_result(None)
+            data, ended = frame.value.body, frame.value.end_body
+        else:
+            if not self.ready.done():
+                self.fail(ConnectionError("Muse response body arrived without headers"))
+                return False
+            data, ended = frame.value.data, frame.value.end_body
+        if data:
+            if self._buffered + len(data) > self._max_buffer_bytes:
+                self.fail(BufferError("Muse response consumer fell behind"))
+                return False
+            self._buffered += len(data)
+            offset = 0
+            if self._chunks and len(self._chunks[-1]) < STREAM_CHUNK_BYTES:
+                take = min(len(data), STREAM_CHUNK_BYTES - len(self._chunks[-1]))
+                self._chunks[-1].extend(data[:take])
+                offset = take
+            while offset < len(data):
+                self._chunks.append(bytearray(data[offset:offset + STREAM_CHUNK_BYTES]))
+                offset += STREAM_CHUNK_BYTES
+            self._available.set()
+        if ended:
+            self.ended = self._finished = True
+            self._available.set()
+        return True
+
+    def fail(self, error: Exception) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if not self.ready.done():
+            self.ready.set_exception(error)
+        self._drain()
+        self._error = error
+        self._available.set()
+
+    def _drain(self) -> None:
+        self._chunks.clear()
+        self._buffered = 0
+
+    def close(self) -> None:
+        if not self.ready.done():
+            self.ready.cancel()
+        self._finished = True
+        self._error = None
+        self._drain()
+        self._available.set()
+
+    def __aiter__(self) -> HttpStream:
+        return self
+
+    async def __anext__(self) -> bytes:
+        while True:
+            if self._chunks:
+                chunk = self._chunks.popleft()
+                self._buffered -= len(chunk)
+                return bytes(chunk)
+            if self._error is not None:
+                raise self._error
+            if self._finished:
+                raise StopAsyncIteration
+            self._available.clear()
+            await self._available.wait()
 
 
 class _Request:
