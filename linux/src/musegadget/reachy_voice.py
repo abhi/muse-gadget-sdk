@@ -18,6 +18,7 @@ from enum import Enum
 from typing import Awaitable, Callable
 
 from musegadget import __version__
+from musegadget import reachy_expression_plan as plan
 from musegadget.link_client import DeviceDescription, LinkSession, Outcome
 from musegadget.reachy_capabilities import WAKE_CUE, Backends, Expression, ReplyStyle, SpokenLine
 from musegadget.reachy_expression import transcript_text
@@ -548,6 +549,18 @@ class VoiceConversation:
         self._output_busy = False
         self._output_prefetched = False
         self._defer_playback = False
+        self._planner = plan.ExpressionPlanner()
+
+    async def _plan(self, event: plan.Event) -> None:
+        for cue in self._planner.on(event, time.monotonic()):
+            await self._apply_cue(cue)
+
+    async def _apply_cue(self, cue: plan.Cue) -> None:
+        if cue.expression is None:
+            await asyncio.to_thread(self.hardware.set_state, cue.state.value)
+        else:
+            await asyncio.to_thread(self.hardware.set_state, cue.state.value,
+                                    expression=cue.expression.value)
 
     def _has_output(self) -> bool:
         return (self._speech_pending > 0 or self._speaker_lock.locked() or self._output_busy
@@ -608,10 +621,9 @@ class VoiceConversation:
                     await close_job(job)
                     self._output_busy = False
                 if self._output_queue.empty() and not following.done():
-                    await asyncio.to_thread(self.hardware.set_state,
-                        "listening" if self._playback.user_speaking else
-                        "thinking" if self.tracker is not None else
-                        "listening" if self._wake_deadline is not None else "idle")
+                    await self._plan(plan.OutputIdle(user_speaking=self._playback.user_speaking,
+                                                     turn_open=self.tracker is not None,
+                                                     wake_open=self._wake_deadline is not None))
                     if self._wake_deadline is not None:
                         self._wake_deadline = time.monotonic() + (self.wake_timeout_s or 10.0)
         finally:
@@ -803,12 +815,11 @@ class VoiceConversation:
                 gap_quiet_samples = max(0, gap_quiet_samples - len(sample))
             was_speaking = self._playback.user_speaking
             self._playback.set_user_speaking(speaking or gap_quiet_samples > 0)
-            if (self._playback.user_speaking and not was_speaking
-                    and (self._has_output() or turn_task is not None)):
-                await asyncio.to_thread(self.hardware.set_state, "listening")
-            elif was_speaking and not self._playback.user_speaking and not self._has_output():
-                if turn_task is not None or pending_turns:
-                    await asyncio.to_thread(self.hardware.set_state, "thinking")
+            if self._playback.user_speaking != was_speaking:
+                await self._plan(plan.UserSpeech(speaking=self._playback.user_speaking,
+                                                 output=self._has_output(),
+                                                 turn_running=turn_task is not None,
+                                                 turns_waiting=bool(pending_turns)))
             elapsed = time.monotonic() - started
             if elapsed > max(.1, len(sample) / self.hardware.sample_rate * 2) and started - last_slow_feed > 10:
                 log.warning("Reachy microphone processing took %.3fs for %.3fs of audio",
@@ -862,7 +873,7 @@ class VoiceConversation:
                     return True, None
             return False, None
 
-        await asyncio.to_thread(self.hardware.set_state, "idle")
+        await self._plan(plan.Started())
         turn_task = (asyncio.create_task(self.turn(None))
                      if self.backends.reply_style is not ReplyStyle.MUSE_VOICE
                      and wake is None and not self.owns_chat else None)
@@ -937,14 +948,14 @@ class VoiceConversation:
                                 import av
                                 wake_resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
                             log.info("Reachy's wake window closed after empty recognition and inactivity")
-                    if not pending_turns and not self._has_output():
-                        listening = recorder.active or wake is not None and self._wake_deadline is not None
-                        await asyncio.to_thread(self.hardware.set_state, "listening" if listening else "idle")
+                    await self._plan(plan.TurnDone(
+                        turns_waiting=bool(pending_turns), output=self._has_output(), recording=recorder.active,
+                        wake_open=wake is not None and self._wake_deadline is not None))
                 if turn_task is None and pending_turns:
                     request = pending_turns.popleft()
                     active_wake_epoch = request.wake_epoch
-                    if not self._has_output() and not self._playback.user_speaking:
-                        await asyncio.to_thread(self.hardware.set_state, "thinking")
+                    await self._plan(plan.Working(output=self._has_output(),
+                                                  user_speaking=self._playback.user_speaking))
                     async def process(request=request):
                         try:
                             endpoint = await hearing.endpoint(request.wav, request.recognition)
@@ -983,7 +994,7 @@ class VoiceConversation:
                         if wake_resampler is not None:
                             import av
                             wake_resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
-                        await asyncio.to_thread(self.hardware.set_state, "idle")
+                        await self._plan(plan.WakeClosed())
                         log.info("Reachy's wake window closed after inactivity")
                 captured = await capture.get()
                 if captured is None:
@@ -1002,8 +1013,8 @@ class VoiceConversation:
                     if wake_resampler is not None:
                         import av
                         wake_resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
-                    if self._wake_deadline is None and not self._muted and turn_task is None:
-                        await asyncio.to_thread(self.hardware.set_state, "idle")
+                    await self._plan(plan.CaptureGap(wake_open=self._wake_deadline is not None,
+                                                     muted=self._muted, turn_running=turn_task is not None))
                     log.warning("Reachy microphone capture lost continuity (%s); speech detectors reset; %s",
                                 captured.gap_reason or "upstream gap",
                                 "microphone remains open" if self._wake_deadline is not None else "waiting for wake")
@@ -1040,7 +1051,7 @@ class VoiceConversation:
                         self._wake_first_request_pending = True
                         if self._has_output() or self._muted:
                             self._playback.set_user_speaking(True)
-                        await asyncio.to_thread(self.hardware.set_state, "listening", expression="happy")
+                        await self._plan(plan.WakeHeard())
                         await asyncio.to_thread(wake.reset)
                         log.info("Reachy heard its wake phrase; microphone open")
                         if wake_tail is None:
@@ -1087,9 +1098,9 @@ class VoiceConversation:
                 else:
                     active_before = recorder.active
                     wav = await record(sample)
-                    if recorder.active != active_before and turn_task is None:
-                        await asyncio.to_thread(self.hardware.set_state,
-                                                 "listening" if recorder.active else "idle")
+                    if recorder.active != active_before:
+                        await self._plan(plan.Recording(active=recorder.active,
+                                                        turn_running=turn_task is not None))
                 if wav is None:
                     continue
                 while wav is not None:
@@ -1178,8 +1189,8 @@ class VoiceConversation:
             else:
                 await self._speak(None, text=text, state="listening", stream_segment=True)
         try:
-            if not self._has_output() and not self._playback.user_speaking:
-                await asyncio.to_thread(self.hardware.set_state, "thinking")
+            await self._plan(plan.Working(output=self._has_output(),
+                                          user_speaking=self._playback.user_speaking))
             text = None
             if wav is not None and (self.backends.hearing.transcribes or recognized_text is not None):
                 text = (recognized_text if recognized_text is not None
@@ -1211,8 +1222,8 @@ class VoiceConversation:
                         completed = True
                         return TurnOutcome.WAKE_CUE
                 log.info("Recognized %d characters from Reachy's microphone", len(text))
-                if not self._has_output() and not self._playback.user_speaking:
-                    await asyncio.to_thread(self.hardware.set_state, "thinking")
+                await self._plan(plan.Working(output=self._has_output(),
+                                              user_speaking=self._playback.user_speaking))
             self.tracker = ReplyTracker(self.session_id, style=self.backends.reply_style,
                                         owns_chat=self.owns_chat, replay_scope=self._replay_scope)
             self._logged_activity = None
@@ -1310,7 +1321,7 @@ class VoiceConversation:
                                 voice=self.backends.progress_voice, progress=True))
                     if (self.backends.reply_style is ReplyStyle.EXPRESSIVE_JSON and not waiting_for_segment
                             and not self._has_output() and not self._playback.user_speaking):
-                        await asyncio.to_thread(self.hardware.set_state, "thinking")
+                        await self._plan(plan.Working(output=False, user_speaking=False))
                         waiting_for_segment = True
                     continue
                 if isinstance(reply, TaskFinished):
