@@ -23,7 +23,7 @@ from musegadget.link_client import DeviceDescription, LinkSession, Outcome
 from musegadget.reachy_capabilities import WAKE_CUE, Backends, EndedTurn, Endpoint, Expression, ReplyStyle, SpokenLine
 from musegadget.reachy_expression import transcript_text
 from musegadget.reachy_follow_up import FollowUp, classify_follow_up, is_small_talk, request_topic
-from musegadget.reachy_progress import BackendStatus, ProgressPlan, backend_status_from_event
+from musegadget.reachy_progress import BackendStatus, ProgressPlan, ProgressUpdate, backend_status_from_event
 from musegadget.service import DEFAULT_NOISE_HOST, Service
 from musegadget.speech_playback import PCMPlayer, SpeechPlayback
 
@@ -1512,7 +1512,7 @@ class VoiceConversation:
                         log.info("Reachy selected %s progress %.1fs after the voice turn",
                                  progress.source, time.monotonic() - started)
                         job.aside = asyncio.create_task(
-                            self._say_progress(job, progress.text, progress_said))
+                            self._say_progress(job, progress, progress_said))
                 if (job.style is ReplyStyle.EXPRESSIVE_JSON and not waiting_for_segment
                         and not self._has_output() and not self._playback.user_speaking):
                     await self._plan(plan.Working(output=False, user_speaking=False))
@@ -1704,12 +1704,17 @@ class VoiceConversation:
                 prepared.cancel()
                 await prepared.aclose()
 
-    async def _say_progress(self, job: MuseJob, status: str, already_said: list) -> None:
-        line = await self.backends.narrator.say_progress(job.request or "", status, tuple(already_said))
-        if line is not None:
-            already_said.append(line.text)
-            await self._speak(None, text=line.text, state="thinking", stream_segment=True,
-                              voice=self.backends.progress_voice, progress=True)
+    async def _say_progress(self, job: MuseJob, progress: ProgressUpdate, already_said: list) -> None:
+        if progress.source == "waiting":
+            text = progress.text
+        else:
+            line = await self.backends.narrator.say_progress(job.request or "", progress.text, tuple(already_said))
+            if line is None:
+                return
+            text = line.text
+            already_said.append(text)
+        await self._speak(None, text=text, state="thinking", stream_segment=True,
+                          voice=self.backends.progress_voice, progress=True)
 
     async def _speak_lines(self, message_id: str, lines) -> None:
         for index, line in enumerate(lines):

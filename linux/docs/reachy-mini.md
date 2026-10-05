@@ -241,8 +241,15 @@ may wait behind earlier speech even after its text has arrived.
 With local speech enabled, Reachy can give a short progress update when an
 accepted request takes longer to answer. A fresh, explicit public action or
 public progress frame can provide the first update immediately. A generic
-phase or waiting update waits 20 seconds. Later updates are at least 20 seconds
-apart while the request remains active.
+phase or waiting update waits 5 seconds (`PROGRESS_FIRST_S`). After that,
+Reachy speaks every 15 seconds (`PROGRESS_EVERY_S`) while the request remains
+active, at most 6 lines per request (`PROGRESS_MAX_LINES`), and never while you
+are talking. A tick with a new public label or phase speaks that; a tick with
+nothing new speaks the next of a small rotating set of waiting lines ("Still on
+it.", "Working on that for you.", "Muse is still digging in.", "Thanks for
+waiting."), which never repeats one line twice in a row and never claims a
+result. Reachy speaks these waiting lines itself; the companion narrator only
+rephrases Muse's own labels.
 The progress worker runs separately from answer playback and is canceled when
 the answer arrives, so a progress cue does not hold up the reply.
 
@@ -681,10 +688,9 @@ Omit `kind`, or set it to `answer`, for normal speech. A progress frame uses
 `expression` to `thinking` or `null`. It describes a real action that started or
 a milestone that completed. It must not contain hidden reasoning, raw tool
 arguments, or invented results. Muse can send a frame whenever a real stage
-changes; the adapter spaces updates at least twenty seconds apart. It speaks
-each reported activity or phase once per turn. Without new information it stays
-quiet instead of repeating the same milestone; a generic waiting cue can play
-once when no useful progress is available.
+changes; the adapter speaks at most one update per 15-second tick. It speaks
+each reported activity or phase once per turn. Without new information it says
+one of its rotating waiting lines instead of repeating the same milestone.
 Progress frames are excluded from final-answer reconciliation, so they are not
 replayed with the completed answer. Local backend phase updates use the same
 progress timing and thinking motion.

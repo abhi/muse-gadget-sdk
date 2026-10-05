@@ -100,7 +100,7 @@ def answer_after(delay_s, reply, *, when=None):
                 await asyncio.sleep(delay_s)
             await session.events.put(chat_event("delta.message_done", "reply-1", content=reply))
             await session.delivered.get()
-            await session.events.put(chat_event("task.status", status="completed"))
+            await session.events.put(chat_event("task.status", seq=2, status="completed"))
             await session.delivered.get()
         session.scripts.append(asyncio.create_task(answer()))
         return asyncio.sleep(0)
@@ -161,3 +161,42 @@ def test_an_answer_arriving_mid_acknowledgement_lets_it_finish_then_plays_at_onc
     assert sum(1 for chunk in hardware.played if labels.text(chunk) == ack) == 10
     finished_ack = hardware.timeline[0][1] + 10 * .05
     assert hardware.timeline[1][1] - finished_ack < .3
+
+
+def test_a_long_turn_without_labels_keeps_saying_waiting_lines_without_asking_the_narrator(monkeypatch):
+    from musegadget.reachy_progress import ProgressPlan
+    labels = Labels()
+    hardware = PacedHardware(labels)
+    narrated = []
+    build = conversation_for(labels, hardware, "Can you search for robot history?")
+
+    def paced(session):
+        conversation = build(session)
+        narrator = conversation.backends.narrator
+        narrator.progress = lambda request, started: ProgressPlan(request, started, first_delay_s=1.2,
+                                                                  interval_s=.4)
+        say_progress = narrator.say_progress
+
+        async def observed(request, status, already_said):
+            narrated.append(status)
+            return await say_progress(request, status, already_said)
+        narrator.say_progress = observed
+        return conversation
+
+    def working_then_answer(session):
+        async def muse():
+            while len(hardware.spoken()) < 5:
+                await asyncio.sleep(.01)
+            await session.events.put(chat_event("delta.message_done", "reply-1", seq=2,
+                                                content="Robots began as toys."))
+            await session.delivered.get()
+            await session.events.put(chat_event("task.status", seq=3, status="completed"))
+            await session.delivered.get()
+        session.scripts.append(asyncio.create_task(muse()))
+        return asyncio.sleep(0)
+
+    run_turn(monkeypatch, paced, working_then_answer)
+    assert hardware.spoken() == [
+        "Let me look that up.", "I haven't received a detailed progress update yet.",
+        "Still on it.", "Working on that for you.", "Muse is still digging in.", "Robots began as toys."]
+    assert narrated == ["I haven't received a detailed progress update yet."]

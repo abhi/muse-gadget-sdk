@@ -333,7 +333,7 @@ def test_owned_chat_backend_stages_are_spoken_once_and_answer_stops_them(monkeyp
                                      session_id="robot-chat", owns_chat=True)
     tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON, owns_chat=True)
     tracker.acknowledge({"message_id": "user-1", "session_id": "robot-chat", "is_thread": True})
-    job = muse_job(tracker, progress=ProgressPlan("Look up the documentation.", 0))
+    job = muse_job(tracker, progress=ProgressPlan("Look up the documentation.", 0, first_delay_s=20, interval_s=20))
     clock = 8.153
     asyncio.run(conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
                                                         activity_text="Searching web")), job))
@@ -342,11 +342,11 @@ def test_owned_chat_backend_stages_are_spoken_once_and_answer_stops_them(monkeyp
     asyncio.run(conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
                                                         activity_text="Searching sources")), job))
     assert job.progress.take(40).text == "Muse's last reported step was searching sources."
-    assert job.progress.take(60) is None
+    assert job.progress.take(60).text == "Still on it."
     clock = 61
     asyncio.run(conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
                                                         activity_text="is responding")), job))
-    assert job.progress.take(80) is None
+    assert job.progress.take(80).text == "Working on that for you."
     assert job.replies.empty()
     clock = 81
     asyncio.run(conversation._queue_replies(tracker.event(chat_event("delta.text_append", "answer", parent=None,

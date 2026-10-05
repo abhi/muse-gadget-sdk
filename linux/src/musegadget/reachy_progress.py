@@ -10,7 +10,12 @@ import re
 from typing import Literal
 
 
-ProgressSource = Literal["backend", "frame", "fallback"]
+ProgressSource = Literal["backend", "frame", "fallback", "waiting"]
+PROGRESS_FIRST_S = 5.0
+PROGRESS_EVERY_S = 15.0
+PROGRESS_MAX_LINES = 6
+# Spoken in turn when Muse reports nothing new; never a claim about the result.
+WAITING_LINES = ("Still on it.", "Working on that for you.", "Muse is still digging in.", "Thanks for waiting.")
 # These limits apply to incoming public frames. Trusted history attribution
 # adds three words when an older frame is spoken without truncating its report.
 MAX_PROGRESS_BYTES = 240
@@ -50,7 +55,7 @@ PUBLIC_PROGRESS_PHRASES = (
     _LATEST_FLIGHTS, _LATEST_FARES, _LATEST_COMPARE, _LATEST_WEB,
     _LATEST_SOURCES, _LATEST_WEBSITE, _LATEST_CONNECTOR,
     _WORKING, _RESPONDING, _LAST_WORKING, _LAST_RESPONDING,
-    *_RESPONDING_HISTORY.values(),
+    *_RESPONDING_HISTORY.values(), *WAITING_LINES,
 )
 
 _PRIVATE_PAYLOAD = re.compile(
@@ -153,11 +158,11 @@ def backend_status_from_event(activity_code: object, activity_text: object) -> B
 
 
 class ProgressPlan:
-    """Speak distinct turn-scoped updates, at most once per cadence interval."""
+    """Speak turn-scoped updates once per cadence interval: news first, else the next waiting line."""
 
-    def __init__(self, request_text: str, started: float, *, first_delay_s: float = 20,
-                 interval_s: float = 20, expiry_s: float = 10,
-                 max_updates: int | None = None):
+    def __init__(self, request_text: str, started: float, *, first_delay_s: float = PROGRESS_FIRST_S,
+                 interval_s: float = PROGRESS_EVERY_S, expiry_s: float = 10,
+                 max_updates: int | None = PROGRESS_MAX_LINES):
         self._waiting = waiting_progress(request_text)
         self._first_due = started + first_delay_s
         self._interval_s = interval_s
@@ -165,6 +170,7 @@ class ProgressPlan:
         self._max_updates = max_updates
         self._last_cue = None
         self._emitted = 0
+        self._waited = 0
         self._spoken = set()
         self._spoken_activities = set()
         self._spoken_phases = set()
@@ -244,9 +250,13 @@ class ProgressPlan:
                         self._spoken_phases.add(status.phase)
             if text is not None:
                 update = ProgressUpdate(text, "backend")
+        if update is None and self._emitted:
+            update = ProgressUpdate(WAITING_LINES[self._waited % len(WAITING_LINES)], "waiting")
+            self._waited += 1
+            self._last_cue = now
+            self._emitted += 1
+            return update
         if update is None:
-            if self._emitted:
-                return None
             update = ProgressUpdate(self._waiting, "fallback")
         self._last_cue = now
         self._emitted += 1

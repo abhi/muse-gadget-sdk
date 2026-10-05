@@ -61,6 +61,10 @@
   "progress_tts:Muse is preparing a reply. Its last reported step was searching sources.",
   "progress_tts:Muse is preparing a reply. Its last reported step was checking a website.",
   "progress_tts:Muse is preparing a reply. Its last reported step was using a connector.",
+  "progress_tts:Still on it.",
+  "progress_tts:Working on that for you.",
+  "progress_tts:Muse is still digging in.",
+  "progress_tts:Thanks for waiting.",
   "tts:I already have your next question waiting. Please ask that again after I answer.",
   "tts:Sunny and warm all day.",
   "tts:It is nine in the morning there."
