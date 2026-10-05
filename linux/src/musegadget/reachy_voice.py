@@ -20,7 +20,7 @@ from typing import Awaitable, Callable
 from musegadget import __version__
 from musegadget import reachy_expression_plan as plan
 from musegadget.link_client import DeviceDescription, LinkSession, Outcome
-from musegadget.reachy_capabilities import WAKE_CUE, Backends, Expression, ReplyStyle, SpokenLine
+from musegadget.reachy_capabilities import WAKE_CUE, Backends, EndedTurn, Expression, ReplyStyle, SpokenLine
 from musegadget.reachy_expression import transcript_text
 from musegadget.reachy_progress import BackendStatus, ProgressPlan, backend_status_from_event
 from musegadget.service import DEFAULT_NOISE_HOST, Service
@@ -101,17 +101,15 @@ class _CapturedAudio:
 
 @dataclass(frozen=True)
 class _RecordedTurn:
-    wav: bytes
-    recognition: asyncio.Future | None = None
+    ended: EndedTurn
     endpoint_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass(frozen=True)
 class _QueuedTurn:
-    wav: bytes
+    ended: EndedTurn
     wake_strip_required: bool
     wake_epoch: int
-    recognition: asyncio.Future | None = None
     endpoint_at: float = field(default_factory=time.monotonic)
 
 
@@ -816,7 +814,7 @@ class VoiceConversation:
             started = time.monotonic()
             feed = asyncio.get_running_loop().run_in_executor(recorder_worker, recorder.feed, sample)
             try:
-                result = await asyncio.shield(feed)
+                await asyncio.shield(feed)
             except asyncio.CancelledError:
                 await asyncio.gather(feed, return_exceptions=True)
                 raise
@@ -825,14 +823,11 @@ class VoiceConversation:
             for _ in range(heard.failures):
                 transcription_failed()
             if heard.transcript_lost:
-                if heard.dropped:
-                    result = None
                 self._wake_strip_required = False
                 self._wake_first_request_pending = False
                 recorder.finish_initial_capture()
-            recognition = heard.recognition
-            if recognition is not None:
-                recognitions.add(recognition)
+            if heard.ended is not None:
+                turns_awaiting_transcript.add(heard.ended)
             speaking = recorder.speech_active
             if speaking:
                 gap_quiet_samples = 0
@@ -855,7 +850,7 @@ class VoiceConversation:
                 log.warning("Reachy microphone processing took %.3fs for %.3fs of audio",
                             elapsed, len(sample) / self.hardware.sample_rate)
                 last_slow_feed = started
-            return _RecordedTurn(result, recognition, endpoint_at) if result is not None else None
+            return _RecordedTurn(heard.ended, endpoint_at) if heard.ended is not None else None
 
         wake = self.wake_detector
         if wake is not None:
@@ -908,30 +903,25 @@ class VoiceConversation:
                      if self.backends.reply_style is not ReplyStyle.MUSE_VOICE
                      and wake is None and not self.owns_chat else None)
         pending_turns = deque()
-        recognitions = set()
+        turns_awaiting_transcript = set()
         wake_epoch = 0
         active_wake_epoch = 0
         async def queue_turn(recorded: _RecordedTurn) -> None:
             nonlocal recorder
-            if recorder.last_truncated:
+            if recorded.ended.truncated:
                 log.info("voice turn reached the 60-second recording limit; continuing capture")
             if len(pending_turns) < PENDING_TURN_LIMIT:
-                recognition = recorded.recognition
-                if recognition is None:
-                    recognition = hearing.recognize(recorded.wav)
-                    if recognition is not None:
-                        recognitions.add(recognition)
-                pending_turns.append(_QueuedTurn(recorded.wav, self._wake_strip_required, wake_epoch,
-                                                recognition, recorded.endpoint_at))
+                recorded.ended.start()
+                pending_turns.append(_QueuedTurn(recorded.ended, self._wake_strip_required, wake_epoch,
+                                                recorded.endpoint_at))
                 if self._wake_strip_required:
                     recorder.finish_initial_capture()
                 self._wake_strip_required = False
                 self._wake_first_request_pending = False
                 log.info("Reachy queued a voice turn; %d pending", len(pending_turns))
             else:
-                if recorded.recognition is not None:
-                    recorded.recognition.cancel()
-                    recognitions.discard(recorded.recognition)
+                recorded.ended.cancel()
+                turns_awaiting_transcript.discard(recorded.ended)
                 self._input_overflow = True
                 log.warning("Reachy question queue full; saved turns retained, retry notice pending")
             if wake is not None and self.wake_timeout_s == 0:
@@ -988,7 +978,7 @@ class VoiceConversation:
                                                   user_speaking=self._playback.user_speaking))
                     async def process(request=request):
                         try:
-                            endpoint = await hearing.endpoint(request.wav, request.recognition)
+                            endpoint = await request.ended.endpoint()
                             if endpoint is None:
                                 transcription_failed()
                                 return TurnOutcome.EMPTY
@@ -1001,7 +991,7 @@ class VoiceConversation:
                                 wake_strip_required=request.wake_strip_required,
                                 recognized_text=endpoint.text, defer_playback=True)
                         finally:
-                            recognitions.discard(request.recognition)
+                            turns_awaiting_transcript.discard(request.ended)
                     turn_task = asyncio.create_task(process())
                 if not ready and turn_task is None:
                     log.info("Reachy speech yield ready: microphone priority, ordered background replies")
@@ -1104,18 +1094,18 @@ class VoiceConversation:
                                     if self.wake_timeout_s == 0:
                                         break
                                 else:
-                                    if wav is not None and wav.recognition is not None:
-                                        wav.recognition.cancel()
-                                        recognitions.discard(wav.recognition)
+                                    if wav is not None:
+                                        wav.ended.cancel()
+                                        turns_awaiting_transcript.discard(wav.ended)
                                     wav = completed
                                 # Drain any same-buffer speech after an older pre-roll endpoint.
                                 completed = await record(captured[:0])
                             if wake_tail is not None and self.wake_timeout_s == 0 and self._wake_deadline is None:
                                 break
                         if recorder.active:
-                            if wav is not None and wav.recognition is not None:
-                                wav.recognition.cancel()
-                                recognitions.discard(wav.recognition)
+                            if wav is not None:
+                                wav.ended.cancel()
+                                turns_awaiting_transcript.discard(wav.ended)
                             wav = None
                         pre_roll.clear()
                         pre_roll_samples = 0
@@ -1146,9 +1136,9 @@ class VoiceConversation:
             if turn_task is not None:
                 turn_task.cancel()
                 await asyncio.gather(turn_task, return_exceptions=True)
-            for recognition in recognitions:
-                recognition.cancel()
-            await asyncio.gather(*recognitions, return_exceptions=True)
+            for ended in turns_awaiting_transcript:
+                ended.cancel()
+            await asyncio.gather(*(ended.endpoint() for ended in turns_awaiting_transcript), return_exceptions=True)
             speaker.cancel()
             await asyncio.gather(speaker, return_exceptions=True)
             self._playback.set_user_speaking(False)

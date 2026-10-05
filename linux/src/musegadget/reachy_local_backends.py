@@ -7,7 +7,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import Callable, Optional, Tuple
+from typing import Awaitable, Callable, Optional, Tuple
 
 from musegadget.reachy_capabilities import (
     WAKE_CUE, Backends, Endpoint, Expression, HeardAudio, Mode, Partial, ReplyStyle, SpokenLine,
@@ -43,12 +43,53 @@ def contextual_acknowledgement(text: str) -> str | None:
     return None
 
 
+class _LocalEndedTurn:
+    """A turn Silero or WebRTC ended, recognized by the streaming or the batch transcriber."""
+
+    def __init__(self, wav: bytes, recognition: Optional[asyncio.Future],
+                 transcribe: Optional[Callable[[bytes], Awaitable[str]]], truncated: bool):
+        self.wav = wav
+        self.truncated = truncated
+        self._recognition = recognition
+        self._transcribe = transcribe
+        self._cancelled = False
+
+    def start(self) -> None:
+        """Start whole-turn recognition at the endpoint, while earlier turns still play."""
+        if self._recognition is None and self._transcribe is not None and not self._cancelled:
+            self._recognition = asyncio.create_task(self._transcribe(self.wav))
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        if self._recognition is not None:
+            self._recognition.cancel()
+
+    async def endpoint(self) -> Optional[Endpoint]:
+        """The turn as Muse receives it; None when its transcription was lost."""
+        from musegadget.streaming_transcription import StreamingTranscriptionError, StreamingWorkerError
+
+        self.start()
+        if self._recognition is None:
+            return Endpoint(self.wav, None)
+        try:
+            text = await self._recognition
+        except StreamingWorkerError:
+            raise
+        except StreamingTranscriptionError:
+            return None
+        return Endpoint(self.wav, text)
+
+
 class LocalHearingTurn:
-    def __init__(self, recorder, recognizer=None):
+    """One TurnRecorder, fed to a streaming recognizer while the user speaks."""
+
+    def __init__(self, recorder, recognizer=None, transcribe=None):
         self._recorder = recorder
         self._recognizer = recognizer
+        self._transcribe = transcribe
         self._turn = None
         self._failed = False
+        self._wav = None
 
     @property
     def active(self) -> bool:
@@ -59,17 +100,13 @@ class LocalHearingTurn:
         return getattr(self._recorder, "speech_active", self._recorder.active)
 
     @property
-    def last_truncated(self) -> bool:
-        return self._recorder.last_truncated
-
-    @property
     def partial(self) -> Optional[Partial]:
         if self._turn is None or not self._turn.partial.text:
             return None
         return self._turn.partial
 
-    def feed(self, samples):
-        return self._recorder.feed(samples)
+    def feed(self, samples) -> None:
+        self._wav = self._recorder.feed(samples)
 
     def finish_initial_capture(self) -> None:
         self._recorder.finish_initial_capture()
@@ -77,6 +114,7 @@ class LocalHearingTurn:
     def take(self) -> HeardAudio:
         from musegadget.voice_audio import SpeechAudio, SpeechEnd
 
+        wav, self._wav = self._wav, None
         events = self._recorder.take_audio_events() if self._recognizer is not None else ()
         recognition = None
         failures = 0
@@ -98,7 +136,10 @@ class LocalHearingTurn:
                 self._turn = None
                 self._failed = False
         failures += self._listen(audio)
-        return HeardAudio(recognition, failures, transcript_lost, accepted_turn_lost)
+        ended = None
+        if wav is not None and not accepted_turn_lost:
+            ended = _LocalEndedTurn(wav, recognition, self._transcribe, self._recorder.last_truncated)
+        return HeardAudio(ended, failures, transcript_lost)
 
     def _listen(self, audio: bytearray) -> int:
         from musegadget.streaming_transcription import StreamingTranscriptionError, StreamingWorkerError
@@ -148,10 +189,8 @@ class LocalHearing:
         recorder = TurnRecorder(sample_rate, silence_s=silence_s, max_s=60.0,
                                 **({"stream_audio": True} if self._streaming else {}),
                                 **({"vad": vad} if vad is not None else {}), **options)
-        return LocalHearingTurn(recorder, self.transcriber if self._streaming else None)
-
-    def recognize(self, wav: bytes) -> Optional[asyncio.Task]:
-        return asyncio.create_task(self.transcribe(wav)) if self._batch else None
+        return LocalHearingTurn(recorder, self.transcriber if self._streaming else None,
+                                self.transcribe if self._batch else None)
 
     async def transcribe(self, wav: bytes) -> str:
         if self._lock is None:
@@ -161,20 +200,6 @@ class LocalHearing:
             text = await asyncio.wait_for(self.transcriber.transcribe(wav), 60)
             log.info("Speech recognition took %.1fs", time.monotonic() - started)
             return text
-
-    async def endpoint(self, wav: bytes, recognition: Optional[asyncio.Future]) -> Optional[Endpoint]:
-        """The turn as Muse receives it; None when its transcription was lost."""
-        from musegadget.streaming_transcription import StreamingTranscriptionError, StreamingWorkerError
-
-        if recognition is None:
-            return Endpoint(wav, None)
-        try:
-            text = await recognition
-        except StreamingWorkerError:
-            raise
-        except StreamingTranscriptionError:
-            return None
-        return Endpoint(wav, text)
 
 
 class _Replay:

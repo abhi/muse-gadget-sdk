@@ -78,23 +78,37 @@ class SpokenLine:
     muse_message_id: Optional[str] = None
 
 
+class EndedTurn(Protocol):
+    """One user turn whose end the hearing decided; its transcript may still be on the way."""
+
+    truncated: bool                # the turn hit the 60-second recording cap
+
+    def start(self) -> None: ...   # begin recognition now, if it waits for the caller; idempotent
+    def cancel(self) -> None: ...
+    async def endpoint(self) -> Optional[Endpoint]: ...   # None: its transcription was lost
+
+
 @dataclass(frozen=True)
 class HeardAudio:
-    recognition: Optional[asyncio.Future] = None
+    """What one feed told the caller."""
+
+    ended: Optional[EndedTurn] = None   # at most one ended turn per take; feed nothing to drain the next
     failures: int = 0              # recognizer failures; each one owes the user a retry notice
-    transcript_lost: bool = False
-    dropped: bool = False
+    transcript_lost: bool = False  # an utterance ended without a usable transcript
 
 
 class HearingTurn(Protocol):
-    """One endpointed recording. ``feed`` may run off the event loop; ``take`` may not."""
+    """One listening window, which may hold several user turns.
 
-    active: bool
+    The robot decides when the window opens and closes; the implementation decides where
+    each user turn inside it ends. ``feed`` may run off the event loop; ``take`` may not.
+    """
+
+    active: bool                   # inside a user turn that has not ended yet
     speech_active: bool
-    last_truncated: bool
     partial: Optional[Partial]     # the open utterance's transcript so far; never sent to Muse
 
-    def feed(self, samples: np.ndarray) -> Optional[bytes]: ...
+    def feed(self, samples: np.ndarray) -> None: ...
     def take(self) -> HeardAudio: ...
     def finish_initial_capture(self) -> None: ...
     def abort(self) -> None: ...
@@ -106,9 +120,7 @@ class Hearing(Protocol):
     async def start(self) -> None: ...
     def open_turn(self, sample_rate: int, *, silence_s: float, vad: object = None,
                   **options) -> HearingTurn: ...
-    def recognize(self, wav: bytes) -> Optional[asyncio.Future]: ...
     async def transcribe(self, wav: bytes) -> str: ...
-    async def endpoint(self, wav: bytes, recognition: Optional[asyncio.Future]) -> Optional[Endpoint]: ...
 
 
 class PreparedVoice(Protocol):
