@@ -16,6 +16,7 @@
   {"expression": "curious", "robot": "set_state", "state": "thinking"},
   {"audio": "progress_tts:Searching the web now.", "robot": "play"},
   {"robot": "clear_audio"},
+  {"name": "nod", "robot": "gesture"},
   {"expression": "happy", "robot": "set_state", "state": "speaking"},
   {"audio": "tts:Robots learned to fold laundry.", "robot": "play"},
   {"expression": null, "robot": "set_state", "state": "idle"},

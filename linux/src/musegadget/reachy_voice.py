@@ -563,6 +563,12 @@ class VoiceConversation:
             await asyncio.to_thread(self.hardware.set_state, cue.state.value,
                                     expression=cue.expression and cue.expression.value)
 
+    def _without_wake(self, text: str) -> str:
+        phrase = self.wake_detector.phrase
+        if self._wake_strip_required:
+            return question_after_wake(text, phrase) or ""
+        return strip_wake_prefix(text, phrase)
+
     def _pose_expression(self, state: str, expression: str | None) -> str | None:
         if state != "thinking" or expression is not None:
             return expression
@@ -689,7 +695,7 @@ class VoiceConversation:
                     had_message = bool(tracker.messages)
                     had_text = any(message["text"].strip() for message in tracker.messages.values())
                     completed_before = {message_id for message_id, message in tracker.messages.items() if message["done"]}
-                    self._queue_replies(tracker.event(event), tracker)
+                    await self._queue_replies(tracker.event(event), tracker)
                     self._log_backend_activity()
                     if self._turn_started is not None:
                         elapsed = time.monotonic() - self._turn_started
@@ -714,13 +720,22 @@ class VoiceConversation:
                 log.info("Muse backend activity %s %.1fs after the voice turn", code, elapsed)
                 self._activity_log_count += 1
 
-    def _queue_replies(self, replies, tracker: ReplyTracker) -> None:
+    async def _vary_thinking_pose_if_cooled_down(self) -> None:
+        status = self._muse_status
+        if status is not None:
+            await self._plan(plan.MuseStatus(
+                status.phase, status.activity.current_text if status.activity else None,
+                output=self._has_output()))
+
+    async def _queue_replies(self, replies, tracker: ReplyTracker) -> None:
         pending = []
         while not self._replies.empty():
             pending.append(self._replies.get_nowait())
+        status_arrived = False
         for reply in (*pending, *replies):
             if isinstance(reply, BackendStatusSegment):
                 self._muse_status = reply.status
+                status_arrived = True
                 if self._progress is not None:
                     accepted = self._progress.set_status(reply.status, time.monotonic())
                     if accepted and reply.status != self._logged_progress_status:
@@ -755,6 +770,8 @@ class VoiceConversation:
                     _line(reply.message_id, reply.text, reply.expression), self.hardware.output_sample_rate)
                 if prepared is not None:
                     self._prepared_speech[key] = prepared
+        if status_arrived:
+            await self._vary_thinking_pose_if_cooled_down()
 
     def _discard_prepared(self, key) -> None:
         prepared = self._prepared_speech.pop(key, None)
@@ -830,7 +847,9 @@ class VoiceConversation:
                                                  turns_waiting=bool(pending_turns)))
             partial = recorder.partial
             if partial is not None:
-                await self._plan(plan.Partial(partial.text, partial.revision, output=self._has_output()))
+                if self.wake_detector is not None:
+                    partial = replace(partial, text=self._without_wake(partial.text))
+                await self._plan(plan.Heard(partial, speech_active=speaking, output=self._has_output()))
             elapsed = time.monotonic() - started
             if elapsed > max(.1, len(sample) / self.hardware.sample_rate * 2) and started - last_slow_feed > 10:
                 log.warning("Reachy microphone processing took %.3fs for %.3fs of audio",
@@ -1280,7 +1299,7 @@ class VoiceConversation:
             self._voice_context_sent = True
             if wav is not None and self.backends.progress_voice is not None:
                 self._progress = self.backends.narrator.progress(request_text, time.monotonic())
-            self._queue_replies(self.tracker.acknowledge(response), self.tracker)
+            await self._queue_replies(self.tracker.acknowledge(response), self.tracker)
             self._log_backend_activity()
             if wav is None:
                 log.info("Muse accepted Reachy's expression setup")
@@ -1317,11 +1336,7 @@ class VoiceConversation:
                 except asyncio.TimeoutError:
                     if progress_task is not None and progress_task.done():
                         await finish_progress()
-                    status = self._muse_status
-                    if status is not None:
-                        await self._plan(plan.MuseStatus(
-                            status.phase, status.activity.current_text if status.activity else None,
-                            output=self._has_output()))
+                    await self._vary_thinking_pose_if_cooled_down()
                     if (self._input_overflow and progress_task is None and self.backends.voice.speaks_text
                             and not self._has_output() and not self._playback.user_speaking):
                         self._input_overflow = False
@@ -1345,8 +1360,6 @@ class VoiceConversation:
                     continue
                 log.info("%s next Muse reply %.1fs after the voice turn",
                          "Queueing" if defer_playback else "Playing", now - started)
-                if not played and wav is not None:
-                    await self._plan(plan.AnswerArrived(output=self._has_output()))
                 if isinstance(reply, SpeechSegment):
                     message = self.tracker.messages[reply.message_id]
                     if message["stream_revised"] or reply.index < message["stream_skip_before"]:
@@ -1358,6 +1371,8 @@ class VoiceConversation:
                     if not is_current():
                         self._discard_prepared((reply.message_id, reply.index))
                         continue
+                    if not played and wav is not None:
+                        await self._plan(plan.AnswerArrived(output=self._has_output()))
                     def mark_spoken(message=message):
                         message["stream_spoken"] += 1
                     prepared = self._prepared_speech.get((reply.message_id, reply.index))
@@ -1368,7 +1383,7 @@ class VoiceConversation:
                             reply.message_id, reply.text, reply.expression, prepared,
                             is_current, mark_spoken, started))
                         response_deadline += time.monotonic() - queued_at
-                        self._queue_replies([], self.tracker)
+                        await self._queue_replies([], self.tracker)
                         played = True
                         continue
                     speaking = self._speak(reply.message_id, text=reply.text, expression=reply.expression,
@@ -1377,6 +1392,8 @@ class VoiceConversation:
                                            is_current=is_current, on_start=mark_spoken)
                 else:
                     await stop_progress()
+                    if not played and wav is not None:
+                        await self._plan(plan.AnswerArrived(output=self._has_output()))
                     if defer_playback:
                         line, = self.backends.narrator.lines(
                             self.tracker.messages[reply]["text"], self.backends.reply_style, message_id=reply)
@@ -1404,7 +1421,7 @@ class VoiceConversation:
                         await prepared.aclose()
                 if isinstance(reply, SpeechSegment):
                     # Refill the single sentence of lookahead after the current one finishes.
-                    self._queue_replies([], self.tracker)
+                    await self._queue_replies([], self.tracker)
                 played = True
         except asyncio.CancelledError:
             turn_cancelled = True

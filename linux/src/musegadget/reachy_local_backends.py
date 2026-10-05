@@ -66,7 +66,7 @@ class LocalHearingTurn:
     def partial(self) -> Optional[Partial]:
         if self._turn is None or not self._turn.partial.text:
             return None
-        return Partial(self._turn.partial.text, self._turn.partial.revision)
+        return self._turn.partial
 
     def feed(self, samples):
         return self._recorder.feed(samples)

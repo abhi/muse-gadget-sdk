@@ -19,6 +19,8 @@ from pathlib import Path
 import struct
 import sys
 
+from musegadget.reachy_capabilities import Partial
+
 SAMPLE_RATE = 16000
 MAX_TURN_SAMPLES = 60 * SAMPLE_RATE
 MAX_PACKET_BYTES = 64 * 1024
@@ -45,12 +47,6 @@ class StreamingWorkerError(StreamingTranscriptionError):
 
 
 @dataclass(frozen=True)
-class TranscriptRevision:
-    revision: int
-    text: str
-
-
-@dataclass(frozen=True)
 class _Command:
     operation: int
     turn: StreamingTurn
@@ -69,10 +65,10 @@ class StreamingTurn:
         self._discarded = False
         self._opened = False
         self._samples = 0
-        self._partial = TranscriptRevision(0, "")
+        self._partial = Partial("", 0, turn_id)
 
     @property
-    def partial(self) -> TranscriptRevision:
+    def partial(self) -> Partial:
         return self._partial
 
     def _completed(self, future) -> None:
@@ -211,7 +207,7 @@ call. A hung call kills/reaps the process and fails every affected turn.
         if turn._discarded:
             return
         turn._discarded = turn._sealed = True
-        turn._partial = TranscriptRevision(turn._partial.revision + 1, "")
+        turn._partial = Partial("", turn._partial.revision + 1, turn._id)
         retained = deque()
         for command in self._commands:
             if command.turn is turn:
@@ -279,7 +275,7 @@ call. A hung call kills/reaps the process and fails every affected turn.
                         elif command.operation in {_FEED, _FINISH}:
                             text = response["text"].strip()
                             if text != turn.partial.text:
-                                turn._partial = TranscriptRevision(turn.partial.revision + 1, text)
+                                turn._partial = Partial(text, turn.partial.revision + 1, turn._id)
                             if command.operation == _FINISH:
                                 self._turns.pop(turn._id, None)
                                 if not turn._future.done():

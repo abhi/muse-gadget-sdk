@@ -8,21 +8,19 @@ from enum import Enum
 import math
 from typing import Callable, Dict, Optional, Tuple, Union
 
-from musegadget.reachy_capabilities import Expression
+from musegadget.reachy_capabilities import Expression, Partial
 from musegadget.reachy_hardware import GESTURE_DURATION_S
 
 
-TILT_WORDS = 3                 # new words heard before Reachy tilts its head to show it follows
-GESTURE_GAP_S = GESTURE_DURATION_S  # a listening tilt or nod waits for the previous gesture to finish
-NOD_EVERY_S = 3.0              # at most one listening nod this often
-PAUSE_S = 0.6                  # an unchanged transcript this long counts as a clause end
-CLAUSE_WORDS = ("and", "so")   # a transcript ending in one of these words ends a clause
-VARY_EVERY_S = 4.0             # at most one change of thinking motion this often
+TILT_WORDS = 3
+GESTURE_GAP_S = GESTURE_DURATION_S
+NOD_EVERY_S = 3.0
+CLAUSE_PAUSE_S = 0.6
+CLAUSE_WORDS = ("and", "so")
+VARY_EVERY_S = 4.0
 
 
 class State(str, Enum):
-    """The resting states the planner may put Reachy in; speech and errors belong elsewhere."""
-
     IDLE = "idle"
     LISTENING = "listening"
     THINKING = "thinking"
@@ -102,15 +100,15 @@ class TurnStarted:
 
 
 @dataclass(frozen=True)
-class Partial:
-    """The streaming transcript so far, observed on every microphone chunk while the user talks.
+class Heard:
+    """The open utterance's transcript, observed on every microphone chunk while the user talks.
 
-    Revisions strictly increase within one utterance; a lower or repeated revision with other
-    text is a new utterance. ``output`` is whether Reachy has speech playing or queued.
+    ``speech_active`` is the recorder's voice activity: false means the user is silent right now.
+    ``output`` is whether Reachy has speech playing or queued.
     """
 
-    text: str
-    revision: int
+    partial: Partial
+    speech_active: bool
     output: bool
 
 
@@ -148,7 +146,7 @@ class OutputIdle:
 
 
 Event = Union[Started, WakeHeard, WakeClosed, CaptureGap, Recording, UserSpeech, Working,
-              TurnStarted, Partial, MuseStatus, AnswerArrived, TurnDone, OutputIdle]
+              TurnStarted, Heard, MuseStatus, AnswerArrived, TurnDone, OutputIdle]
 
 
 class ExpressionPlanner:
@@ -156,10 +154,11 @@ class ExpressionPlanner:
         self._state: Optional[State] = None
         self._gesture_at = -math.inf
         self._nod_at = -math.inf
-        self._heard = Partial("", 0, False)
-        self._heard_at = -math.inf
+        self._utterance_id: Optional[int] = None
+        self._words = 0
         self._words_at_gesture = 0
-        self._nodded_revision = 0
+        self._quiet_since: Optional[float] = None
+        self._nodded: Optional[Tuple[int, int]] = None
         self._answered = False
         self._status_shown: Optional[Tuple[str, Optional[str]]] = None
         self._varied_at = -math.inf
@@ -174,7 +173,7 @@ class ExpressionPlanner:
             UserSpeech: self._user_speech,
             Working: self._working,
             TurnStarted: self._turn_started,
-            Partial: self._partial,
+            Heard: self._heard,
             MuseStatus: self._muse_status,
             AnswerArrived: self._answer_arrived,
             TurnDone: self._turn_done,
@@ -194,7 +193,7 @@ class ExpressionPlanner:
 
     def _gesture(self, name: str, now: float) -> Tuple[Cue, ...]:
         self._gesture_at = now
-        self._words_at_gesture = len(self._heard.text.split())
+        self._words_at_gesture = self._words
         return (Gesture(name),)
 
     def _started(self, event: Started, now: float) -> Tuple[Cue, ...]:
@@ -237,23 +236,29 @@ class ExpressionPlanner:
         self._thinking_expression = None
         return self._working(Working(event.output, event.user_speaking), now)
 
-    def _partial(self, event: Partial, now: float) -> Tuple[Cue, ...]:
-        if event.revision != self._heard.revision or event.text != self._heard.text:
-            if event.revision <= self._heard.revision:
-                self._words_at_gesture = 0
-                self._nodded_revision = 0
-            self._heard = event
-            self._heard_at = now
+    def _heard(self, event: Heard, now: float) -> Tuple[Cue, ...]:
+        partial = event.partial
+        words = partial.text.split()
+        if partial.utterance_id != self._utterance_id:
+            self._utterance_id = partial.utterance_id
+            self._words_at_gesture = 0
+            self._quiet_since = None
+        self._words = len(words)
+        self._words_at_gesture = min(self._words_at_gesture, self._words)
+        if event.speech_active:
+            self._quiet_since = None
+        elif self._quiet_since is None:
+            self._quiet_since = now
         if event.output or self._state is not State.LISTENING or now - self._gesture_at < GESTURE_GAP_S:
             return ()
-        words = event.text.split()
-        clause_end = (event.text.endswith(",") or (bool(words) and words[-1].casefold() in CLAUSE_WORDS)
-                      or now - self._heard_at >= PAUSE_S)
-        if clause_end and event.revision != self._nodded_revision and now - self._nod_at >= NOD_EVERY_S:
-            self._nodded_revision = event.revision
+        paused = self._quiet_since is not None and now - self._quiet_since >= CLAUSE_PAUSE_S
+        clause_end = partial.text.endswith(",") or (bool(words) and words[-1].casefold() in CLAUSE_WORDS) or paused
+        heard = (partial.utterance_id, partial.revision)
+        if clause_end and heard != self._nodded and now - self._nod_at >= NOD_EVERY_S:
+            self._nodded = heard
             self._nod_at = now
             return self._gesture(NOD, now)
-        if len(words) - self._words_at_gesture >= TILT_WORDS:
+        if self._words - self._words_at_gesture >= TILT_WORDS:
             return self._gesture(TILT, now)
         return ()
 

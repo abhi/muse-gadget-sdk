@@ -331,22 +331,22 @@ def test_owned_chat_backend_stages_are_spoken_once_and_answer_stops_them(monkeyp
     tracker.acknowledge({"message_id": "user-1", "session_id": "robot-chat", "is_thread": True})
     conversation._progress = ProgressPlan("Look up the documentation.", 0)
     clock = 8.153
-    conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
-                                                        activity_text="Searching web")), tracker)
+    asyncio.run(conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
+                                                        activity_text="Searching web")), tracker))
     assert conversation._progress.take(20).text == "Muse's last reported step was searching the web."
     clock = 22.183
-    conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
-                                                        activity_text="Searching sources")), tracker)
+    asyncio.run(conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
+                                                        activity_text="Searching sources")), tracker))
     assert conversation._progress.take(40).text == "Muse's last reported step was searching sources."
     assert conversation._progress.take(60) is None
     clock = 61
-    conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
-                                                        activity_text="is responding")), tracker)
+    asyncio.run(conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
+                                                        activity_text="is responding")), tracker))
     assert conversation._progress.take(80) is None
     assert conversation._replies.empty()
     clock = 81
-    conversation._queue_replies(tracker.event(chat_event("delta.text_append", "answer", parent=None,
-                                                        text=sentence_frame("Here is the documentation."))), tracker)
+    asyncio.run(conversation._queue_replies(tracker.event(chat_event("delta.text_append", "answer", parent=None,
+                                                        text=sentence_frame("Here is the documentation."))), tracker))
     assert conversation._progress.take(100) is None
     assert conversation._replies.get_nowait() == SpeechSegment("answer", 0, "Here is the documentation.", "neutral")
 
@@ -362,17 +362,17 @@ def test_lunch_request_reports_working_phase_before_delayed_answer(monkeypatch):
     tracker = owned_tracker()
     conversation._progress = ProgressPlan("What should I cook for lunch?", 0)
     clock = 2
-    conversation._queue_replies(tracker.event(chat_event(
-        "agent.status", parent=None, activity_code="working", activity_text="is working")), tracker)
+    asyncio.run(conversation._queue_replies(tracker.event(chat_event(
+        "agent.status", parent=None, activity_code="working", activity_text="is working")), tracker))
     update = conversation._progress.take(20)
     assert update.source == "backend"
     assert update.text == "Muse's latest status is that it's working on your request."
     clock = 27
-    conversation._queue_replies(tracker.event(chat_event(
-        "agent.status", parent=None, activity_code="responding", activity_text="is responding")), tracker)
-    conversation._queue_replies(tracker.event(chat_event(
+    asyncio.run(conversation._queue_replies(tracker.event(chat_event(
+        "agent.status", parent=None, activity_code="responding", activity_text="is responding")), tracker))
+    asyncio.run(conversation._queue_replies(tracker.event(chat_event(
         "delta.text_append", "lunch-answer", parent=None,
-        text=sentence_frame("Try a quick vegetable omelette.", "happy"))), tracker)
+        text=sentence_frame("Try a quick vegetable omelette.", "happy"))), tracker))
     assert conversation._progress.take(40) is None
     assert conversation._replies.get_nowait() == SpeechSegment(
         "lunch-answer", 0, "Try a quick vegetable omelette.", "happy")
@@ -389,9 +389,9 @@ def test_early_public_milestone_survives_the_first_twenty_second_cue(monkeypatch
     tracker = owned_tracker()
     conversation._progress = ProgressPlan("Find a recipe.", 0)
     clock = 1
-    conversation._queue_replies(tracker.event(chat_event(
+    asyncio.run(conversation._queue_replies(tracker.event(chat_event(
         "delta.text_append", "recipe-progress", parent=None,
-        text=progress_frame("I found three recipes that match your ingredients."))), tracker)
+        text=progress_frame("I found three recipes that match your ingredients."))), tracker))
     assert conversation._progress.take(20).text == (
         "Earlier from Muse: I found three recipes that match your ingredients.")
     assert conversation._replies.empty()
@@ -3445,3 +3445,19 @@ def test_cli_passes_explicit_session_or_default_route_to_service(
     monkeypatch.setattr(reachy_voice, "ReachyService", Service)
     assert reachy_cli.main(["--state-dir", str(tmp_path), "run", *chat_args]) == 0
     assert selected == [expected_session]
+
+
+@pytest.mark.parametrize("strip_required, text, expected", [
+    (False, "Hey Muse, what is the time", "what is the time"),
+    (False, "what is the time", "what is the time"),
+    (True, "um hey muse what is", "what is"),
+    (True, "um hey mu", ""),
+])
+def test_partial_transcripts_leave_out_the_wake_phrase(strip_required, text, expected):
+    class Wake:
+        phrase = "hey muse"
+    session = FakeSession()
+    conversation = VoiceConversation(session, FakeHardware(), backends=backends_for(Mode.MUSE_VOICE, session),
+                                     wake_detector=Wake())
+    conversation._wake_strip_required = strip_required
+    assert conversation._without_wake(text) == expected

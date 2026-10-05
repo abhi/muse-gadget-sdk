@@ -54,8 +54,11 @@ class Mode(Enum):
 
 @dataclass(frozen=True)
 class Partial:
+    """One utterance's streaming transcript so far; ``revision`` rises with each change of text."""
+
     text: str
     revision: int
+    utterance_id: int              # a new id for every utterance, even one repeating the last
 
 
 @dataclass(frozen=True)

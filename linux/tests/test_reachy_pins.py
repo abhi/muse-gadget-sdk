@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import functools
 import json
 import os
@@ -9,7 +10,7 @@ import pytest
 from musegadget import reachy_voice
 from musegadget.identity import Identity
 from musegadget.link_client import Outcome
-from musegadget.reachy_capabilities import Mode
+from musegadget.reachy_capabilities import Mode, Partial
 from musegadget.reachy_local_backends import backends_for
 from test_reachy_voice import FakeHardware, FakeSession, chat_event, mp3_tone, sentence_frame  # noqa: F401
 
@@ -191,18 +192,17 @@ class FailingStreamingTranscriber:
 
 class ScriptedStreamingTranscriber:
     def __init__(self):
-        from musegadget.streaming_transcription import TranscriptRevision
-        self.partial = TranscriptRevision(0, "")
+        self.partial = Partial("", 0, 0)
 
     def say(self, text):
-        from musegadget.streaming_transcription import TranscriptRevision
-        self.partial = TranscriptRevision(self.partial.revision + 1, text)
+        self.partial = Partial(text, self.partial.revision + 1, self.partial.utterance_id)
 
     async def start(self):
         pass
 
     def open_turn(self):
         transcriber = self
+        self.partial = dataclasses.replace(self.partial, utterance_id=self.partial.utterance_id + 1)
 
         class Turn:
             @property
