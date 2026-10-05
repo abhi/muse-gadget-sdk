@@ -3489,3 +3489,20 @@ def test_partial_transcripts_leave_out_the_wake_phrase(strip_required, text, exp
                                      wake_detector=Wake())
     conversation._wake_strip_required = strip_required
     assert conversation._without_wake(text) == expected
+
+
+def test_added_detail_keeps_the_request_open_until_a_task_started_after_it_finishes():
+    tracker = ReplyTracker("robot-chat", owns_chat=True)
+    ack = {"session_id": "robot-chat", "is_thread": True}
+    tracker.acknowledge({**ack, "message_id": "user-1"})
+    tracker.event(chat_event("task.status", task_id="task-1", status="running"))
+    tracker.expect_follow_up()
+    tracker.acknowledge({**ack, "message_id": "user-2"}, follow_up=True)
+    assert tracker.event(chat_event("delta.message_done", "reply-1", seq=2, content="Try primavera.")) == ["reply-1"]
+    tracker.event(chat_event("task.status", task_id="task-1", seq=3, status="completed"))
+    assert tracker.complete(time.monotonic() + 20, played=True) is False
+    assert tracker.complete(time.monotonic() + 31, played=True) is True
+    tracker.event(chat_event("task.status", parent=None, task_id="task-2", seq=4, status="running"))
+    assert tracker.complete(time.monotonic() + 60, played=True) is False
+    tracker.event(chat_event("task.status", parent=None, task_id="task-2", seq=5, status="completed"))
+    assert tracker.complete(time.monotonic(), played=True) is True

@@ -20,8 +20,9 @@ from typing import Awaitable, Callable
 from musegadget import __version__
 from musegadget import reachy_expression_plan as plan
 from musegadget.link_client import DeviceDescription, LinkSession, Outcome
-from musegadget.reachy_capabilities import WAKE_CUE, Backends, EndedTurn, Expression, ReplyStyle, SpokenLine
+from musegadget.reachy_capabilities import WAKE_CUE, Backends, EndedTurn, Endpoint, Expression, ReplyStyle, SpokenLine
 from musegadget.reachy_expression import transcript_text
+from musegadget.reachy_follow_up import FollowUp, classify_follow_up, request_topic
 from musegadget.reachy_progress import BackendStatus, ProgressPlan, backend_status_from_event
 from musegadget.service import DEFAULT_NOISE_HOST, Service
 from musegadget.speech_playback import PCMPlayer, SpeechPlayback
@@ -30,11 +31,21 @@ log = logging.getLogger(__name__)
 REPLY_TIMEOUT_S = 180.0
 SPEECH_TIMEOUT_S = 180.0
 REPLY_QUIET_S = 3.0
+# Muse may fold added detail into its answer to the original without a separate reply.
+DETAIL_REPLY_QUIET_S = 30.0
 EMPTY_REPLY_GRACE_S = 1.0
 ECHO_TAIL_S = 0.35
 PENDING_TURN_LIMIT = 8
 INPUT_OVERFLOW_CUE = "My question queue is full. Please repeat that after I finish."
 TRANSCRIPTION_RETRY_CUE = "I missed part of that. Please say it again."
+LATE_ANSWER_S = 20.0
+ANSWER_HOLD_LIMIT_S = 8.0
+CANCEL_ACKNOWLEDGEMENT = "Okay, I'll drop that."
+STOP_REQUEST = "Please stop working on my previous request."
+# Muse may answer Reachy's stop request without naming it as the parent; such messages
+# this soon after a stop are taken as that answer, not the next request's.
+STOP_REPLY_WINDOW_S = 5.0
+QUEUE_FULL_CUE = "I already have your next question waiting. Please ask that again after I answer."
 
 
 def strip_wake_prefix(text: str, phrase: str) -> str:
@@ -257,6 +268,17 @@ class ReplayScope:
             self.retire(self.event_ids(event))
 
 
+def acknowledged_message_ids(response: dict) -> set[str]:
+    result = response.get("result", response)
+    if not isinstance(result, dict):
+        raise ValueError("Muse returned an invalid chat acknowledgement")
+    user_ids = {result[k] for k in ("message_id", "reply_to_message_id")
+                if isinstance(result.get(k), str) and result[k]}
+    if not user_ids:
+        raise ValueError("Muse chat acknowledgement omitted the user message ID")
+    return user_ids
+
+
 @dataclass
 class ReplyTracker:
     """Bind assistant messages to one acknowledged microphone turn."""
@@ -276,6 +298,10 @@ class ReplyTracker:
     replay_scope: ReplayScope | None = None
     observed_ids: set[tuple[str, str]] = field(default_factory=set)
     running_task_ids: set[str] = field(default_factory=set)
+    unanswered_follow_up_ids: set[str] = field(default_factory=set)
+    follow_up_task_ids: set[str] = field(default_factory=set)
+    parentless_until: float = 0.0
+    ignored_messages: set[str] = field(default_factory=set)
 
     def retire(self) -> None:
         if self.owns_chat and self.replay_scope is not None:
@@ -284,17 +310,24 @@ class ReplyTracker:
             for event in self.pending:
                 self.replay_scope.retire(ReplayScope.event_ids(event))
 
-    def acknowledge(self, response: dict) -> list[
+    def expect_follow_up(self) -> None:
+        """Hold events until Muse acknowledges one more user message for this request."""
+        self.acknowledged = False
+
+    def acknowledge(self, response: dict, *, follow_up: bool = False) -> list[
             str | SpeechSegment | ProgressSegment | BackendStatusSegment | TaskFinished]:
-        result = response.get("result", response)
-        if not isinstance(result, dict):
-            raise ValueError("Muse returned an invalid chat acknowledgement")
-        self.user_ids = {result[k] for k in ("message_id", "reply_to_message_id")
-                         if isinstance(result.get(k), str) and result[k]}
-        if not self.user_ids:
-            raise ValueError("Muse chat acknowledgement omitted the user message ID")
-        if self.owns_chat and any(len(value) > 512 for value in self.user_ids):
+        """Bind replies to the acknowledged user message; a follow-up adds its message to the earlier ones."""
+        user_ids = acknowledged_message_ids(response)
+        if self.owns_chat and any(len(value) > 512 for value in user_ids):
             raise ValueError("Muse returned an oversized chat identifier")
+        result = response.get("result", response)
+        if follow_up:
+            self.user_ids = self.user_ids | user_ids
+            self.unanswered_follow_up_ids |= user_ids
+            self.task_finished = False
+            self.last_activity = time.monotonic()
+        else:
+            self.user_ids = user_ids
         acknowledged_session = result.get("session_id")
         if self.owns_chat and (not self.session_id or acknowledged_session != self.session_id
                                or result.get("is_thread") is not True):
@@ -362,9 +395,15 @@ class ReplyTracker:
                 if terminal and task_id not in self.running_task_ids and not explicitly_linked:
                     return []
                 if status == "running" and isinstance(task_id, str) and task_id:
+                    if self.unanswered_follow_up_ids and task_id not in self.running_task_ids:
+                        self.follow_up_task_ids.add(task_id)
                     self.running_task_ids.add(task_id)
                 if terminal:
                     self.running_task_ids.discard(task_id)
+            if terminal and (parent in self.unanswered_follow_up_ids or task_id in self.follow_up_task_ids):
+                self.unanswered_follow_up_ids.discard(parent)
+                if task_id in self.follow_up_task_ids:
+                    self.unanswered_follow_up_ids.clear()
             if name == "task.status" and isinstance(status, str):
                 self.task_finished = terminal and not (self.owns_chat and self.running_task_ids)
             if isinstance(activity, str):
@@ -392,6 +431,11 @@ class ReplyTracker:
         parent = payload.get("reply_to_message_id") or payload.get("parent_message_id")
         if (parent and parent not in self.user_ids and parent not in self.messages
                 and not (scoped and parent == message_id)):
+            return []
+        if message_id not in self.messages and (
+                message_id in self.ignored_messages or (not parent and time.monotonic() < self.parentless_until)):
+            if len(self.ignored_messages) < 32:
+                self.ignored_messages.add(message_id)
             return []
         if message_id not in self.messages:
             if len(self.messages) >= 32:
@@ -429,6 +473,7 @@ class ReplyTracker:
                 message["text"] = completed_text
             if name == "delta.message_done" or payload.get("display_text_ready") is not False:
                 message["done"] = True
+                self.unanswered_follow_up_ids.discard(parent)
         if len(message["text"].encode("utf-8")) > 64 * 1024 or (
             self.style is ReplyStyle.EXPRESSIVE_JSON and len(message["delta_text"].encode("utf-8")) > 64 * 1024
         ):
@@ -490,11 +535,13 @@ class ReplyTracker:
         return queued
 
     def complete(self, now: float, played: bool) -> bool:
-        return (played and not self.busy and all(m["done"] for m in self.messages.values())
+        return (played and not self.busy
+                and (not self.unanswered_follow_up_ids or now - self.last_activity >= DETAIL_REPLY_QUIET_S)
+                and all(m["done"] for m in self.messages.values())
                 and (self.task_finished or now - self.last_activity >= REPLY_QUIET_S))
 
     def finished_without_text(self, now: float) -> bool:
-        return (self.task_finished and not self.busy
+        return (self.task_finished and not self.busy and not self.unanswered_follow_up_ids
                 and all(m["done"] for m in self.messages.values())
                 and not any(m["queued"] for m in self.messages.values())
                 and now - self.last_activity >= (EMPTY_REPLY_GRACE_S if self.messages else REPLY_QUIET_S))
@@ -515,6 +562,17 @@ class MuseJob:
     acknowledgement: asyncio.Task | None = None
     progress_speech: asyncio.Task | None = None
     answered: bool = False
+    dropped: bool = False          # the user cancelled it; nothing more of it is spoken
+    turned_away: bool = False      # Reachy already told the user a further request must wait
+
+
+@dataclass(frozen=True)
+class _HeldRequest:
+    """A request heard while Muse worked on another; it is sent once that one finishes."""
+
+    audio: bytes
+    text: str | None
+    wake_epoch: int
 
 
 class VoiceConversation:
@@ -547,6 +605,9 @@ class VoiceConversation:
         self._muse_style: ReplyStyle | None = (
             None if wake_detector is not None and not owns_chat else backends.local_style)
         self.job: MuseJob | None = None
+        self._stop_sent_at: float | None = None
+        # True while the user is mid-utterance or Reachy is still acting on what they said.
+        self._hearing_open: Callable[[], bool] = lambda: False
         self._seen_sequences: set[int] = set()
         self._sequence_order = deque()
         self._muted = False
@@ -818,8 +879,11 @@ class VoiceConversation:
             retry_notice_pending = True
             log.warning("Reachy discarded an incomplete transcription; retry notice pending")
 
+        turn_open = False
+
         def make_recorder(**options):
-            nonlocal gap_quiet_samples
+            nonlocal gap_quiet_samples, turn_open
+            turn_open = False
             if recorder is not None:
                 recorder.abort()
             if self._playback.user_speaking:
@@ -831,7 +895,7 @@ class VoiceConversation:
         recorder_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="reachy-recorder")
         last_slow_feed = 0.0
         async def record(sample):
-            nonlocal last_slow_feed, gap_quiet_samples
+            nonlocal last_slow_feed, gap_quiet_samples, turn_open
             # Keep VAD ahead of transcription/TTS work in the shared executor.
             started = time.monotonic()
             feed = asyncio.get_running_loop().run_in_executor(recorder_worker, recorder.feed, sample)
@@ -850,6 +914,8 @@ class VoiceConversation:
                 recorder.finish_initial_capture()
             if heard.ended is not None:
                 turns_awaiting_transcript.add(heard.ended)
+            # Updated with turns_awaiting_transcript, so no instant shows the user done before their turn is queued.
+            turn_open = recorder.active
             speaking = recorder.speech_active
             if speaking:
                 gap_quiet_samples = 0
@@ -928,6 +994,19 @@ class VoiceConversation:
         turns_awaiting_transcript = set()
         wake_epoch = 0
         active_wake_epoch = 0
+        held = None
+        follow_up_task = None
+        self._hearing_open = lambda: turn_open or bool(turns_awaiting_transcript) or follow_up_task is not None
+
+        async def follow_up(request, held):
+            try:
+                endpoint = await request.ended.endpoint()
+                if endpoint is None:
+                    transcription_failed()
+                    return held
+                return await self._follow_up(endpoint, request, held)
+            finally:
+                turns_awaiting_transcript.discard(request.ended)
         async def queue_turn(recorded: _RecordedTurn) -> None:
             nonlocal recorder
             if recorded.ended.truncated:
@@ -995,9 +1074,20 @@ class VoiceConversation:
                                 wake_resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
                             log.info("Reachy's wake window closed after empty recognition and inactivity")
                     await self._plan(plan.TurnDone(
-                        turns_waiting=bool(pending_turns), output=self._has_output(), recording=recorder.active,
-                        wake_open=wake is not None and self._wake_deadline is not None))
-                if turn_task is None and pending_turns:
+                        turns_waiting=bool(pending_turns) or held is not None, output=self._has_output(),
+                        recording=recorder.active, wake_open=wake is not None and self._wake_deadline is not None))
+                if follow_up_task is not None and follow_up_task.done():
+                    held = follow_up_task.result()
+                    follow_up_task = None
+                if turn_task is None and follow_up_task is None and held is not None:
+                    request, held = held, None
+                    active_wake_epoch = request.wake_epoch
+                    await self._plan(plan.Working(output=self._has_output(),
+                                                  user_speaking=self._playback.user_speaking))
+                    turn_task = asyncio.create_task(self.turn(
+                        request.audio, wake_strip_required=False, recognized_text=request.text,
+                        defer_playback=request.text is not None))
+                if turn_task is None and follow_up_task is None and pending_turns:
                     request = pending_turns.popleft()
                     active_wake_epoch = request.wake_epoch
                     await self._plan(plan.Working(output=self._has_output(),
@@ -1008,6 +1098,7 @@ class VoiceConversation:
                             if endpoint is None:
                                 transcription_failed()
                                 return TurnOutcome.EMPTY
+                            turns_awaiting_transcript.discard(request.ended)
                             if endpoint.text is None:
                                 return await self.turn(endpoint.audio,
                                     wake_strip_required=request.wake_strip_required)
@@ -1019,6 +1110,9 @@ class VoiceConversation:
                         finally:
                             turns_awaiting_transcript.discard(request.ended)
                     turn_task = asyncio.create_task(process())
+                if (turn_task is not None and follow_up_task is None and pending_turns
+                        and self.job is not None and self.job.tracker.acknowledged):
+                    follow_up_task = asyncio.create_task(follow_up(pending_turns.popleft(), held))
                 if not ready and turn_task is None:
                     log.info("Reachy speech yield ready: microphone priority, ordered background replies")
                     log.info("Reachy continuous capture ready: silence %.1fs, pending limit %d, %s",
@@ -1029,6 +1123,7 @@ class VoiceConversation:
                              else "Speak naturally; pause to send your turn to Muse.")
                     ready = True
                 if (wake is not None and not self._input_blocked() and turn_task is None
+                        and follow_up_task is None and held is None
                         and not pending_turns and not self._has_output()):
                     if (self._wake_deadline is not None and time.monotonic() >= self._wake_deadline
                             and not recorder.active):
@@ -1159,9 +1254,11 @@ class VoiceConversation:
             producer.cancel()
             await asyncio.gather(producer, return_exceptions=True)
             recorder.abort()
-            if turn_task is not None:
-                turn_task.cancel()
-                await asyncio.gather(turn_task, return_exceptions=True)
+            self._hearing_open = lambda: False
+            for task in (turn_task, follow_up_task):
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
             for ended in turns_awaiting_transcript:
                 ended.cancel()
             await asyncio.gather(*(ended.endpoint() for ended in turns_awaiting_transcript), return_exceptions=True)
@@ -1299,7 +1396,9 @@ class VoiceConversation:
         style = self.backends.reply_style()
         job = self.job = MuseJob(
             None if wav is None else text or "", style,
-            ReplyTracker(self.session_id, style=style, owns_chat=self.owns_chat, replay_scope=self._replay_scope),
+            ReplyTracker(self.session_id, style=style, owns_chat=self.owns_chat, replay_scope=self._replay_scope,
+                         parentless_until=(0.0 if self._stop_sent_at is None
+                                           else self._stop_sent_at + STOP_REPLY_WINDOW_S)),
             started, defer_playback)
         self._logged_activity = None
         self._activity_log_count = 0
@@ -1318,11 +1417,7 @@ class VoiceConversation:
                                                self.session_id, **options)
         else:
             ack = await self.session.send_voice(wav, self.session_id, **options)
-        if not ack.get("ok"):
-            raise ConnectionError(f"Muse rejected conversation request: HTTP {ack.get('status')}")
-        response = ack.get("response")
-        if not isinstance(response, dict):
-            raise ValueError("Muse did not acknowledge the voice note")
+        response = _accepted(ack)
         if text is not None or wav is None:
             self._muse_style = style
         if wav is not None and self.backends.progress_voice is not None:
@@ -1376,6 +1471,9 @@ class VoiceConversation:
         waiting_for_segment = False
         progress_said = []
         while True:
+            if job.dropped:
+                log.info("Reachy stopped relaying a cancelled Muse request")
+                return TurnOutcome.ACCEPTED
             now = time.monotonic()
             if tracker.task_finished:
                 await self._stop_progress(job)
@@ -1422,6 +1520,11 @@ class VoiceConversation:
                 continue
             if isinstance(reply, TaskFinished):
                 continue
+            if not job.answered:
+                response_deadline += await self._hold_answer(job)
+                if job.dropped:
+                    continue
+                now = time.monotonic()
             log.info("%s next Muse reply %.1fs after the voice turn",
                      "Queueing" if job.defer_playback else "Playing", now - started)
             if isinstance(reply, SpeechSegment):
@@ -1431,12 +1534,13 @@ class VoiceConversation:
                     continue
                 await self._stop_progress(job)
                 def is_current(message=message, reply=reply):
-                    return not message["stream_revised"] and reply.index >= message["stream_skip_before"]
+                    return (not job.dropped and not message["stream_revised"]
+                            and reply.index >= message["stream_skip_before"])
                 if not is_current():
                     self._discard_prepared((reply.message_id, reply.index))
                     continue
                 if not job.answered and job.request is not None:
-                    await self._plan(plan.AnswerArrived(output=self._has_output()))
+                    await self._answer_begins(job)
                 def mark_spoken(message=message):
                     message["stream_spoken"] += 1
                 prepared = self._prepared_speech.get((reply.message_id, reply.index))
@@ -1457,7 +1561,7 @@ class VoiceConversation:
             else:
                 await self._stop_progress(job)
                 if not job.answered and job.request is not None:
-                    await self._plan(plan.AnswerArrived(output=self._has_output()))
+                    await self._answer_begins(job)
                 lines = await self.backends.narrator.lines(
                     request_text, tracker.messages[reply]["text"], job.style, message_id=reply)
                 if job.defer_playback:
@@ -1465,7 +1569,7 @@ class VoiceConversation:
                     for line in lines:
                         await self._output_queue.put(_SpeechJob(
                             reply, line.text, line.expression.value if line.expression else None,
-                            started=started))
+                            is_current=lambda: not job.dropped, started=started))
                     response_deadline += time.monotonic() - queued_at
                     job.answered = True
                     continue
@@ -1488,6 +1592,94 @@ class VoiceConversation:
                 # Refill the single sentence of lookahead after the current one finishes.
                 await self._queue_replies([], job)
             job.answered = True
+
+    async def _hold_answer(self, job: MuseJob) -> float:
+        """Wait until the user is not mid-utterance, at most ``ANSWER_HOLD_LIMIT_S``; returns how long it waited.
+
+        Talk that never pauses, such as a conversation in the room, must not keep the answer forever.
+        """
+        since = time.monotonic()
+        while self._hearing_open() and not job.dropped and time.monotonic() - since < ANSWER_HOLD_LIMIT_S:
+            await asyncio.sleep(.05)
+        held = time.monotonic() - since
+        if held >= ANSWER_HOLD_LIMIT_S:
+            log.info("Reachy released Muse's answer after holding it %.1fs while the user kept talking", held)
+        elif held >= .05:
+            log.info("Reachy held Muse's answer %.1fs until the user finished speaking", held)
+        return held
+
+    async def _answer_begins(self, job: MuseJob) -> None:
+        await self._plan(plan.AnswerArrived(output=self._has_output()))
+        topic = request_topic(job.request or "")
+        if not topic or not self.backends.voice.speaks_text or time.monotonic() - job.dispatched_at <= LATE_ANSWER_S:
+            return
+        # A late answer can follow other talk; name what it answers, in the user's own words.
+        intro = f"About {topic}:"
+        log.info("Reachy introduced an answer that arrived %.1fs after its request",
+                 time.monotonic() - job.dispatched_at)
+        if job.defer_playback:
+            await self._output_queue.put(_SpeechJob(None, intro, is_current=lambda: not job.dropped,
+                                                    started=job.started))
+        else:
+            await self._speak(None, text=intro, stream_segment=True)
+
+    async def _follow_up(self, endpoint: Endpoint, request: _QueuedTurn,
+                         held: _HeldRequest | None) -> _HeldRequest | None:
+        """Act on an utterance heard while Muse works; returns the request now waiting behind the job.
+
+        Cancel and added detail apply to the newest request: the held one if any, else the running job.
+        """
+        text = await self._hear(endpoint.audio, endpoint.text, request.wake_strip_required,
+                                started=time.monotonic(), defer_playback=True)
+        if isinstance(text, TurnOutcome):
+            return held
+        kind = FollowUp.NEW if text is None else classify_follow_up(text)
+        job = self.job
+        running = job if job is not None and job.request is not None and not job.dropped else None
+        log.info("Reachy heard a %s follow-up while Muse worked", kind.value)
+        if kind is FollowUp.SILENCE and running is not None and running.answered:
+            await self._drop(running)
+            return held
+        if kind in (FollowUp.CANCEL, FollowUp.SILENCE):
+            await self._announce(CANCEL_ACKNOWLEDGEMENT, started=None, defer_playback=True)
+            if held is None and running is not None:
+                await self._drop(running)
+            return None
+        if kind is FollowUp.ADD_DETAIL:
+            if held is not None:
+                return replace(held, text=f"{held.text} {text}")
+            if running is not None and not running.answered:
+                await self._add_detail(running, text)
+                return None
+        if held is not None:
+            if job is None or not job.turned_away:
+                await self._announce(QUEUE_FULL_CUE, started=None, defer_playback=True)
+            if job is not None:
+                job.turned_away = True
+            return held
+        return _HeldRequest(endpoint.audio, text, request.wake_epoch)
+
+    async def _drop(self, job: MuseJob) -> None:
+        """Stop relaying ``job``. Muse has no cancel call, so Reachy asks it in words on the same chat.
+
+        Once the answer has started, Muse's work is done: Reachy only skips the lines not yet spoken.
+        """
+        job.dropped = True
+        if job.progress is not None:
+            job.progress.stop()
+        if job.answered:
+            log.info("Reachy skipped the rest of an answer the user cancelled")
+            return
+        response = _accepted(await self.session.send_chat(STOP_REQUEST, self.session_id))
+        self._stop_sent_at = time.monotonic()
+        self._replay_scope.retire(("message", value) for value in acknowledged_message_ids(response))
+        log.info("Reachy dropped a Muse request and asked Muse to stop working on it")
+
+    async def _add_detail(self, job: MuseJob, text: str) -> None:
+        job.tracker.expect_follow_up()
+        response = _accepted(await self.session.send_chat(text, self.session_id))
+        await self._queue_replies(job.tracker.acknowledge(response, follow_up=True), job)
+        log.info("Reachy sent Muse more detail for the running request")
 
     async def _acknowledge(self, request: str, started: float) -> None:
         line = await self.backends.narrator.acknowledge(request)
@@ -1702,6 +1894,15 @@ class VoiceConversation:
             log.info("Muse expressed %s through Reachy", expression)
         else:
             log.warning("Reachy rejected Muse expression %s: %s", expression, result.get("error"))
+
+
+def _accepted(ack: dict) -> dict:
+    if not ack.get("ok"):
+        raise ConnectionError(f"Muse rejected conversation request: HTTP {ack.get('status')}")
+    response = ack.get("response")
+    if not isinstance(response, dict):
+        raise ValueError("Muse did not acknowledge the voice note")
+    return response
 
 
 _SETUP_REQUEST = {

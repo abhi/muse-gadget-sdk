@@ -412,21 +412,19 @@ def test_default_voice_endpoint_groups_a_short_pause_and_waits_two_seconds(duple
     asyncio.run(bounded(duplex(run, silence_s=None)))
 
 
-def test_full_queue_preserves_eight_questions_and_speaks_one_retry_notice(duplex):
+def test_full_queue_keeps_eight_questions_then_holds_one_behind_muse_and_turns_the_rest_away(duplex):
     np = pytest.importorskip("numpy")
-    notice = asyncio.Event()
     spoken = []
     overflow_text = "My question queue is full. Please repeat that after I finish."
+    turned_away = "I already have your next question waiting. Please ask that again after I answer."
 
     class Speech:
         async def stream(self, text, rate):
             spoken.append(text)
-            if text == overflow_text:
-                notice.set()
             yield np.zeros(80, np.float32)
 
     async def run(ctx):
-        acknowledged = [asyncio.Event() for _ in range(9)]
+        acknowledged = [asyncio.Event() for _ in range(2)]
         ctx.conversation.backends = replace(ctx.conversation.backends, local_style=ReplyStyle.EXPRESSIVE_JSON)
 
         async def acknowledge(session):
@@ -436,39 +434,45 @@ def test_full_queue_preserves_eight_questions_and_speaks_one_retry_notice(duplex
                                                     "session_id": "robot-chat", "is_thread": True}}
             acknowledged[index].set()
 
+        async def answer(index, expression):
+            parent = f"user-{index + 1}"
+            for seq, event in enumerate([
+                    chat_event("task.status", parent=parent, task_id=f"task-{index}", status="running"),
+                    chat_event("delta.message_done", f"reply-{index}", parent=parent,
+                               display_text=sentence_frame(f"Answer {index + 1}.", expression)),
+                    chat_event("task.status", parent=parent, task_id=f"task-{index}", status="completed")],
+                    start=index * 3 + 1):
+                await ctx.session.events.put({**event, "seq": seq})
+                await ctx.session.delivered.get()
+
         ctx.session.send_hook = acknowledge
         subscriber = asyncio.create_task(ctx.conversation._subscribe())
         try:
+            # While the first question is still being recognized, eight more wait and the tenth overflows.
             await ctx.question(.1)
-            await acknowledged[0].wait()
+            await ctx.entered[0].wait()
             for marker in range(2, 11):
                 await ctx.question(marker / 10)
-            await notice.wait()
-            await ctx.playback.get()
+            for event in ctx.release:
+                event.set()
+            await acknowledged[0].wait()
+            await ctx.entered[8].wait()
             assert ctx.labels() == list(range(1, 10))
-            assert spoken == [overflow_text]
-            for index in range(9):
-                await acknowledged[index].wait()
-                parent = f"user-{index + 1}"
-                expression = "happy" if index % 2 == 0 else "curious"
-                events = [chat_event("task.status", parent=parent, seq=index * 3 + 1,
-                                     task_id=f"task-{index}", status="running"),
-                          chat_event("delta.message_done", f"reply-{index}", parent=parent,
-                                     seq=index * 3 + 2,
-                                     display_text=sentence_frame(f"Answer {index + 1}.", expression)),
-                          chat_event("task.status", parent=parent, seq=index * 3 + 3,
-                                     task_id=f"task-{index}", status="completed")]
-                for event in events:
-                    await ctx.session.events.put(event)
-                    await ctx.session.delivered.get()
-            for _ in range(9):
-                await ctx.playback.get()
-            assert ctx.labels() == list(range(1, 10))
-            assert len(ctx.session.setup_messages) == 9
-            assert spoken == [overflow_text] + [f"Answer {i}." for i in range(1, 10)]
-            assert ctx.hardware.play_expressions == [("thinking", None)] + [
-                ("speaking", "happy" if i % 2 == 0 else "curious") for i in range(9)]
+            # Once Muse has the first, the second is held behind it and the other seven are turned away
+            # with a single notice.
+            while len(spoken) < 2:
+                await asyncio.sleep(.01)
+            assert sorted(spoken) == sorted([overflow_text, turned_away])
+            assert len(ctx.session.setup_messages) == 1
+            await answer(0, "happy")
+            await acknowledged[1].wait()
+            await answer(1, "curious")
+            while len(spoken) < 4:
+                await asyncio.sleep(.01)
+            assert spoken[2:] == ["Answer 1.", "Answer 2."]
+            assert [text.rsplit(": ", 1)[-1] for text, _ in ctx.session.setup_messages] == [
+                "Question one.", "Question one."]
         finally:
             await cancel_task(subscriber)
 
-    asyncio.run(bounded(duplex(run, real_turn=True, speech=Speech(), owned=True)))
+    asyncio.run(bounded(duplex(run, real_turn=True, speech=Speech(), owned=True, hold_recognition=True)))

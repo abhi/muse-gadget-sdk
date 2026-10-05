@@ -271,6 +271,47 @@ Those measurements establish backend web-search status updates. They do not
 establish connector-specific telemetry or show that response frames arrive
 before tool execution.
 
+## Talk while Muse works
+
+Muse can take minutes to answer. After Reachy sends a request, it keeps
+listening: the wake window or continuous listening stays open, and progress
+lines and the thinking motion continue. When the robot recognizes your words
+locally (on-robot and companion modes), a fixed word rule decides what a new
+sentence means. No language model makes this decision.
+
+| You say | Reachy does |
+|---|---|
+| "Never mind", "Cancel", "Stop", "Forget it", "Scratch that", or "Don't bother", alone | Says "Okay, I'll drop that.", stops relaying that request, and skips its unspoken lines. If the answer has not started, it also sends Muse "Please stop working on my previous request." on the same chat. |
+| "Stop talking", "Shut up", or "Be quiet", alone | While an answer plays, skips the rest of it and keeps any request waiting behind it. Otherwise acts as a cancel. |
+| A sentence that starts with "also", "and", "actually", or "oh and", followed by a change such as "make it vegetarian" or "for two people" | Sends it to the same chat as more detail for the running request. |
+| Anything else | Queues it as the next request. |
+
+These rules have limits:
+
+- A cancel or a detail applies to the newest request. That is the queued
+  request if there is one, otherwise the running request.
+- Only one request waits behind the running one. If one is already waiting,
+  Reachy says "I already have your next question waiting. Please ask that
+  again after I answer." It says this once per running request.
+- A detail that arrives after the answer has started becomes a new request.
+- A sentence that starts with "also" or "and" but then asks a question or
+  makes a request of its own, such as "And what's the weather in Paris?" or
+  "Also, remind me to call mom.", is queued as a new request.
+- "Stop the music" is a request, not a cancel, because words other than
+  "that", "it" or "please" follow "stop".
+- Muse has no cancel API. Cancelling stops Reachy from relaying that request,
+  and Muse may finish the work anyway. For 5 seconds after a stop, the next
+  request ignores Muse messages that name no parent message, because they
+  are likely Muse's reply to the stop.
+- In `muse-voice` mode the robot has no transcript, so every sentence spoken
+  during a request is queued as a new request.
+
+Reachy doesn't start an answer while you are speaking, or while it is still
+acting on what you just said, for up to 8 seconds. After that the answer
+plays at the next pause in your speech. If an answer arrives more than 20 seconds after
+its request, Reachy introduces it with a few of your own words, for example
+"About the latest robot news:". Barge-in while Reachy speaks works as before.
+
 ## Wake-word invocation
 
 Enable the [Sherpa offline keyword model](https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html#sherpa-onnx-kws-zipformer-gigaspeech-3-3m-2024-01-01-english)

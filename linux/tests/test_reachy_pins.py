@@ -479,3 +479,292 @@ def test_streaming_partials_tilt_and_nod_while_the_user_talks_and_never_reach_mu
             ("tell me about the old castles", .4), ("tell me about the old castles and", .8),
             ("tell me about the old castles and dragons", .5)])
     check("streaming_partials", run_scenario(rig, service, user))
+
+
+class Transcripts:
+    def __init__(self, *texts):
+        self.texts = list(texts)
+
+    async def transcribe(self, wav):
+        return self.texts.pop(0)
+
+
+def happened_after_first_request(rig, event):
+    events = rig.recording.events
+    sent = next((index for index, item in enumerate(events) if item.get("muse") == "send_chat"), len(events))
+    return event in events[sent:]
+
+
+def test_detail_said_while_muse_works_goes_to_the_same_chat_and_the_answer_waits_for_it(monkeypatch):
+    rig = Rig(monkeypatch)
+
+    async def muse(session, request):
+        if request == 1:
+            await rig.wait_until_or_timeout(lambda: happened_after_first_request(
+                rig, {"robot": "set_state", "state": "listening", "expression": None}), 10)
+            await session.answer(request, "Try pasta primavera. [reachy:happy]")
+        else:
+            await session.answer(request, "Primavera is already vegetarian. [reachy:nod]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=Transcripts("Find me a pasta recipe.", "Also make it vegetarian."))
+
+    async def user():
+        rig.say()
+        await rig.quiet()
+        rig.say(voiced_s=1)
+    check("follow_up_detail", run_scenario(rig, service, user))
+
+
+def test_detail_answered_after_muse_finishes_the_original_is_still_spoken(monkeypatch):
+    rig = Rig(monkeypatch)
+
+    async def muse(session, request):
+        if request == 1:
+            await rig.wait_until_or_timeout(lambda: session.requests == 2, 10)
+            await session.answer(request, "Try pasta primavera. [reachy:happy]")
+        else:
+            await asyncio.sleep(1)
+            await session.answer(request, "Primavera is already vegetarian. [reachy:nod]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=Transcripts("Find me a pasta recipe.", "Also make it vegetarian."))
+
+    async def user():
+        rig.say()
+        await rig.quiet()
+        rig.say(voiced_s=1)
+    record = run_scenario(rig, service, user)
+    assert [event["audio"] for event in record["events"] if event.get("robot") == "play"
+            and event["audio"] in ("tts:Try pasta primavera.", "tts:Primavera is already vegetarian.")] == [
+        "tts:Try pasta primavera.", "tts:Primavera is already vegetarian."]
+    check("follow_up_detail_after_original", record)
+
+
+def test_cancel_while_muse_works_drops_the_request_and_asks_muse_to_stop(monkeypatch):
+    rig = Rig(monkeypatch)
+
+    async def muse(session, request):
+        if request == 1:
+            await rig.wait_until_or_timeout(lambda: session.requests == 2, 10)
+            await session.answer(request, "Robots learned to fold laundry. [reachy:happy]")
+        else:
+            await session.answer(request, "Okay, I stopped. [reachy:nod]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=Transcripts("Can you search for the latest robot news?", "Never mind."))
+
+    async def user():
+        rig.say()
+        await rig.quiet()
+        rig.say()
+    check("follow_up_cancel", run_scenario(rig, service, user))
+
+
+def test_cancel_after_the_answer_started_skips_the_rest_without_asking_muse_to_stop(monkeypatch):
+    rig = Rig(monkeypatch)
+    acknowledged = {"robot": "play", "audio": "tts:" + reachy_voice.CANCEL_ACKNOWLEDGEMENT}
+    rig.hardware.echo_cancelled_input = True
+
+    async def muse(session, request):
+        if request == 1:
+            await session.emit("delta.message_done", "reply-1", request=request,
+                               content="Robots learned to fold laundry. [reachy:happy]")
+            await rig.wait_until_or_timeout(lambda: acknowledged in rig.recording.events, 10)
+            await session.emit("delta.message_done", "reply-1-more", request=request,
+                               content="They also learned to cook. [reachy:nod]")
+            await session.emit("task.status", request=request, status="completed")
+        else:
+            await session.answer(request, "Okay, I stopped. [reachy:nod]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=Transcripts("Can you search for the latest robot news?", "Never mind."))
+
+    async def user():
+        rig.say()
+        await rig.wait_until_or_timeout(
+            lambda: {"robot": "play", "audio": "tts:Robots learned to fold laundry."} in rig.recording.events, 5)
+        rig.say()
+    record = run_scenario(rig, service, user)
+    assert [event["text"] for event in record["events"] if event.get("muse") == "send_chat"] == [
+        "Can you search for the latest robot news?"]
+    assert [event["audio"] for event in record["events"] if event.get("robot") == "play"][-2:] == [
+        "tts:Robots learned to fold laundry.", "tts:" + reachy_voice.CANCEL_ACKNOWLEDGEMENT]
+
+
+def test_stop_talking_during_an_answer_silences_it_and_keeps_the_waiting_request(monkeypatch):
+    rig = Rig(monkeypatch)
+    rig.hardware.echo_cancelled_input = True
+    transcripts = Transcripts("Can you search for the latest robot news?", "What time is it in Tokyo?",
+                              "Stop talking.")
+
+    async def muse(session, request):
+        if request == 1:
+            await rig.wait_until_or_timeout(lambda: len(transcripts.texts) == 1, 10)
+            await session.emit("delta.message_done", "reply-1", request=request,
+                               content="Robots learned to fold laundry. [reachy:happy]")
+            await rig.wait_until_or_timeout(lambda: not transcripts.texts, 10)
+            await asyncio.sleep(.5)
+            await session.emit("delta.message_done", "reply-1-more", request=request,
+                               content="They also learned to cook. [reachy:nod]")
+            await session.emit("task.status", request=request, status="completed")
+        else:
+            await session.answer(request, "It is nine in the morning there. [reachy:nod]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=transcripts)
+
+    async def user():
+        rig.say()
+        await rig.wait_until_or_timeout(lambda: rig.session.requests == 1, 5)
+        rig.say()
+        await rig.wait_until_or_timeout(
+            lambda: {"robot": "play", "audio": "tts:Robots learned to fold laundry."} in rig.recording.events, 5)
+        rig.say()
+    record = run_scenario(rig, service, user)
+    assert [event["text"] for event in record["events"] if event.get("muse") == "send_chat"] == [
+        "Can you search for the latest robot news?", "What time is it in Tokyo?"]
+    assert [event["audio"] for event in record["events"] if event.get("robot") == "play"][-2:] == [
+        "tts:Robots learned to fold laundry.", "tts:It is nine in the morning there."]
+
+
+def test_stop_talking_before_the_answer_cancels_the_request(monkeypatch):
+    rig = Rig(monkeypatch)
+
+    async def muse(session, request):
+        if request == 1:
+            await rig.wait_until_or_timeout(lambda: session.requests == 2, 10)
+            await session.answer(request, "Robots learned to fold laundry. [reachy:happy]")
+        else:
+            await session.answer(request, "Okay, I stopped. [reachy:nod]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=Transcripts("Can you search for the latest robot news?", "Stop talking."))
+
+    async def user():
+        rig.say()
+        await rig.quiet()
+        rig.say()
+    record = run_scenario(rig, service, user)
+    assert [event["text"] for event in record["events"] if event.get("muse") == "send_chat"] == [
+        "Can you search for the latest robot news?", reachy_voice.STOP_REQUEST]
+    plays = [event["audio"] for event in record["events"] if event.get("robot") == "play"]
+    assert "tts:" + reachy_voice.CANCEL_ACKNOWLEDGEMENT in plays
+    assert "tts:Robots learned to fold laundry." not in plays
+
+
+@pytest.mark.parametrize("stop_reply_parent", [None, "user-3"])
+def test_muse_reply_to_the_stop_request_is_not_spoken_as_the_next_answer(monkeypatch, stop_reply_parent):
+    rig = Rig(monkeypatch)
+
+    async def muse(session, request):
+        if request == 1:
+            await session.answer(request, "Ready to talk. [reachy:nod]")
+        elif request == 3:
+            await rig.wait_until_or_timeout(lambda: session.requests == 4, 10)
+            await session.emit("delta.message_done", "stopped", request=request, parent=stop_reply_parent,
+                               content="Okay, I've stopped. [reachy:nod]")
+        elif request == 4:
+            await asyncio.sleep(1)
+            await session.answer(request, "It is nine in the morning there. [reachy:nod]")
+
+    service = rig.service(muse, owned=False, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=Transcripts("Can you search for the latest robot news?", "Never mind.",
+                                                  "What time is it in Tokyo?"))
+
+    async def user():
+        rig.say()
+        await rig.quiet()
+        rig.say()
+        await rig.wait_until_or_timeout(lambda: rig.session.requests == 3, 5)
+        await rig.quiet()
+        rig.say()
+    record = run_scenario(rig, service, user)
+    assert [event["text"].rsplit(": ", 1)[-1] for event in record["events"]
+            if event.get("muse") == "send_chat"][1:] == [
+        "Can you search for the latest robot news?", reachy_voice.STOP_REQUEST, "What time is it in Tokyo?"]
+    plays = [event["audio"] for event in record["events"] if event.get("robot") == "play"]
+    assert "tts:Okay, I've stopped." not in plays
+    assert plays[-1] == "tts:It is nine in the morning there."
+
+
+def test_new_request_waits_behind_the_running_one_and_a_third_is_turned_away(monkeypatch):
+    rig = Rig(monkeypatch)
+
+    async def muse(session, request):
+        if request == 1:
+            turned_away = {"robot": "play", "audio": "tts:" + reachy_voice.QUEUE_FULL_CUE}
+            await rig.wait_until_or_timeout(lambda: turned_away in rig.recording.events, 10)
+            await session.answer(request, "Sunny and warm all day. [reachy:happy]")
+        else:
+            await session.answer(request, "It is nine in the morning there. [reachy:nod]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=Transcripts("What's the weather tomorrow?", "What time is it in Tokyo?",
+                                                  "Who won the game last night?"))
+
+    async def user():
+        rig.say()
+        await rig.quiet()
+        rig.say()
+        await rig.quiet()
+        rig.say()
+    check("follow_up_queued", run_scenario(rig, service, user))
+
+
+def test_answer_held_for_ongoing_talk_is_spoken_after_the_hold_limit_and_turns_talk_away_once(monkeypatch):
+    rig = Rig(monkeypatch)
+    monkeypatch.setattr(reachy_voice, "ANSWER_HOLD_LIMIT_S", 1.0)
+    rig.hardware.echo_cancelled_input = True
+    chatter = ["The game was great.", "Pass the salt.", "I love that song.", "It rained all day.",
+               "We should paint the fence.", "The bus was late."]
+
+    async def muse(session, request):
+        if request == 1:
+            await asyncio.sleep(1)
+            await session.answer(request, "Sunny and warm all day. [reachy:happy]")
+        else:
+            await session.answer(request, "It was a close one. [reachy:nod]")
+
+    class SlowTranscripts(Transcripts):
+        async def transcribe(self, wav):
+            await asyncio.sleep(.8)
+            return await super().transcribe(wav)
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=SlowTranscripts("What's the weather tomorrow?", *chatter))
+    talk_ended = []
+
+    async def user():
+        rig.say()
+        await rig.wait_until_or_timeout(lambda: rig.session.requests == 1, 5)
+        for _ in chatter:
+            for _ in range(round(.6 * 16000 / CHUNK)):
+                rig.hardware.samples.put(np.full(CHUNK, VOICE_SAMPLE, dtype=np.float32))
+                await asyncio.sleep(CHUNK / 16000)
+            for _ in range(round(.3 * 16000 / CHUNK)):
+                rig.hardware.samples.put(np.zeros(CHUNK, dtype=np.float32))
+                await asyncio.sleep(CHUNK / 16000)
+        talk_ended.append(len(rig.recording.events))
+    record = run_scenario(rig, service, user)
+    assert "tts:Sunny and warm all day." in [
+        event["audio"] for event in record["events"][:talk_ended[0]] if event.get("robot") == "play"]
+    plays = [event["audio"] for event in record["events"] if event.get("robot") == "play"]
+    first_job = plays[:plays.index("tts:It was a close one.")]
+    assert first_job.count("tts:" + reachy_voice.QUEUE_FULL_CUE) == 1
+
+
+def test_late_answer_is_introduced_with_the_requests_own_words(monkeypatch):
+    rig = Rig(monkeypatch)
+    monkeypatch.setattr(reachy_voice, "LATE_ANSWER_S", .5)
+
+    async def muse(session, request):
+        await asyncio.sleep(1)
+        await session.answer(request, "Robots learned to fold laundry. [reachy:happy]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=Transcriber("Can you search for the latest robot news?"))
+
+    async def user():
+        rig.say()
+    check("late_answer", run_scenario(rig, service, user))
