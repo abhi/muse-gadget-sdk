@@ -200,3 +200,42 @@ def test_a_long_turn_without_labels_keeps_saying_waiting_lines_without_asking_th
         "Let me look that up.", "I haven't received a detailed progress update yet.",
         "Still on it.", "Working on that for you.", "Muse is still digging in.", "Robots began as toys."]
     assert narrated == ["I haven't received a detailed progress update yet."]
+
+
+def test_a_request_heard_while_muse_works_is_held_with_a_nod_and_later_ones_get_one_short_line(monkeypatch):
+    from test_reachy_pins import Rig, Transcripts, run_scenario
+
+    rig = Rig(monkeypatch)
+    busy = "tts:" + reachy_voice.BUSY_CUE
+
+    transcripts = Transcripts("What's the weather tomorrow?", "What time is it in Tokyo?",
+                              "Who won the game last night?", "How tall is Everest?")
+    marks = {}
+
+    async def muse(session, request):
+        if request == 1:
+            await rig.wait_until_or_timeout(lambda: "fourth" in marks, 10)
+        await session.answer(request, f"Answer {request}. [reachy:happy]")
+
+    service = rig.service(muse, speech=rig.voice(), progress_speech=rig.voice("progress_tts"),
+                          transcriber=transcripts)
+
+    async def user():
+        rig.say()
+        await rig.quiet()
+        marks["second"] = len(rig.recording.events)
+        rig.say()
+        await rig.quiet()
+        marks["third"] = len(rig.recording.events)
+        rig.say()
+        await rig.quiet()
+        rig.say()
+        await rig.wait_until_or_timeout(lambda: not transcripts.texts)
+        marks["fourth"] = len(rig.recording.events)
+    events = run_scenario(rig, service, user)["events"]
+    held = events[marks["second"]:marks["third"]]
+    assert {"robot": "gesture", "name": "nod"} in held
+    assert [event for event in held if event.get("robot") == "play"] == []
+    plays = [event["audio"] for event in events if event.get("robot") == "play"]
+    assert plays.count(busy) == 1
+    assert plays[-2:] == ["tts:Answer 1.", "tts:Answer 2."]

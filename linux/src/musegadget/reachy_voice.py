@@ -47,7 +47,7 @@ STOP_REQUEST = "Please stop working on my previous request."
 # Muse may answer Reachy's stop request without naming it as the parent; such messages
 # this soon after a stop are taken as that answer, not the next request's.
 STOP_REPLY_WINDOW_S = 5.0
-QUEUE_FULL_CUE = "I already have your next question waiting. Please ask that again after I answer."
+BUSY_CUE = "One at a time, please."
 
 
 def strip_wake_prefix(text: str, phrase: str) -> str:
@@ -1653,10 +1653,11 @@ class VoiceConversation:
                 return None
         if held is not None:
             if job is None or not job.turned_away:
-                await self._announce(QUEUE_FULL_CUE, started=None, defer_playback=True)
+                await self._announce(BUSY_CUE, started=None, defer_playback=True)
             if job is not None:
                 job.turned_away = True
             return held
+        await self._plan(plan.RequestHeld())
         return _HeldRequest(endpoint.audio, text, request.wake_epoch)
 
     async def _drop(self, job: MuseJob) -> None:

@@ -305,9 +305,9 @@ These rules have limits:
 
 - A cancel or a detail applies to the newest request. That is the queued
   request if there is one, otherwise the running request.
-- Only one request waits behind the running one. If one is already waiting,
-  Reachy says "I already have your next question waiting. Please ask that
-  again after I answer." It says this once per running request.
+- Only one request waits behind the running one. Reachy holds it without
+  speaking and nods so you know it heard. If one is already waiting, Reachy
+  says "One at a time, please." once per running request and drops the new one.
 - A detail that arrives after the answer has started becomes a new request.
 - A sentence that starts with "also" or "and" but then asks a question or
   makes a request of its own, such as "And what's the weather in Paris?" or

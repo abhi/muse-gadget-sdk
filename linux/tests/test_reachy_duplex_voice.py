@@ -416,7 +416,7 @@ def test_full_queue_keeps_eight_questions_then_holds_one_behind_muse_and_turns_t
     np = pytest.importorskip("numpy")
     spoken = []
     overflow_text = "My question queue is full. Please repeat that after I finish."
-    turned_away = "I already have your next question waiting. Please ask that again after I answer."
+    turned_away = "One at a time, please."
 
     class Speech:
         async def stream(self, text, rate):

@@ -13,11 +13,12 @@
   {"expression": null, "robot": "set_state", "state": "listening"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
+  {"name": "nod", "robot": "gesture"},
   {"expression": null, "robot": "set_state", "state": "listening"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"expression": null, "robot": "set_state", "state": "thinking"},
   {"expression": null, "robot": "set_state", "state": "listening"},
-  {"audio": "tts:I already have your next question waiting. Please ask that again after I answer.", "robot": "play"},
+  {"audio": "tts:One at a time, please.", "robot": "play"},
   {"muse": "send_chat", "options": {}, "session_id": "robot-chat", "text": "What time is it in Tokyo?"},
   {"expression": "happy", "robot": "set_state", "state": "speaking"},
   {"audio": "tts:Sunny and warm all day.", "robot": "play"},
@@ -65,7 +66,7 @@
   "progress_tts:Working on that for you.",
   "progress_tts:Muse is still digging in.",
   "progress_tts:Thanks for waiting.",
-  "tts:I already have your next question waiting. Please ask that again after I answer.",
+  "tts:One at a time, please.",
   "tts:Sunny and warm all day.",
   "tts:It is nine in the morning there."
  ]

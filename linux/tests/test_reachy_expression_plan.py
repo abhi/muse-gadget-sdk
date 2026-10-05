@@ -2,8 +2,8 @@ import pytest
 
 from musegadget.reachy_capabilities import Expression, Partial
 from musegadget.reachy_expression_plan import (
-    AnswerArrived, CaptureGap, ExpressionPlanner, Gesture, Heard, MuseStatus, OutputIdle, Recording, SetState,
-    Started, State, TurnDone, TurnStarted, UserSpeech, WakeClosed, WakeHeard, Working,
+    AnswerArrived, CaptureGap, ExpressionPlanner, Gesture, Heard, MuseStatus, OutputIdle, Recording, RequestHeld,
+    SetState, Started, State, TurnDone, TurnStarted, UserSpeech, WakeClosed, WakeHeard, Working,
 )
 
 IDLE = SetState(State.IDLE)
@@ -244,3 +244,9 @@ def test_thinking_motion(script, expected):
 @pytest.mark.parametrize("script, expected", GOT_IT_NODS.values(), ids=GOT_IT_NODS.keys())
 def test_got_it_nod(script, expected):
     assert plan(script) == expected
+
+
+def test_a_held_request_gets_a_nod_even_mid_answer():
+    assert plan([(0, TurnStarted(output=False, user_speaking=False)),
+                 (.2, AnswerArrived(output=True)),
+                 (.3, RequestHeld())]) == [(0, (THINKING,)), (.2, ()), (.3, (NOD,))]

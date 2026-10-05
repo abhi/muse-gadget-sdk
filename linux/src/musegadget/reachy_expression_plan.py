@@ -129,6 +129,11 @@ class AnswerArrived:
 
 
 @dataclass(frozen=True)
+class RequestHeld:
+    """A request heard while Muse works waits, unspoken, behind the running one."""
+
+
+@dataclass(frozen=True)
 class TurnDone:
     turns_waiting: bool
     output: bool
@@ -146,7 +151,7 @@ class OutputIdle:
 
 
 Event = Union[Started, WakeHeard, WakeClosed, CaptureGap, Recording, UserSpeech, Working,
-              TurnStarted, Heard, MuseStatus, AnswerArrived, TurnDone, OutputIdle]
+              TurnStarted, Heard, MuseStatus, AnswerArrived, RequestHeld, TurnDone, OutputIdle]
 
 
 class ExpressionPlanner:
@@ -176,6 +181,7 @@ class ExpressionPlanner:
             Heard: self._heard,
             MuseStatus: self._muse_status,
             AnswerArrived: self._answer_arrived,
+            RequestHeld: self._request_held,
             TurnDone: self._turn_done,
             OutputIdle: self._output_idle,
         }
@@ -279,6 +285,10 @@ class ExpressionPlanner:
         self._answered = True
         if event.output or self._state is not State.THINKING or now - self._gesture_at < GESTURE_GAP_S:
             return ()
+        self._nod_at = now
+        return self._gesture(NOD, now)
+
+    def _request_held(self, event: RequestHeld, now: float) -> Tuple[Cue, ...]:
         self._nod_at = now
         return self._gesture(NOD, now)
 

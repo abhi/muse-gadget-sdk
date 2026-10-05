@@ -693,7 +693,7 @@ def test_new_request_waits_behind_the_running_one_and_a_third_is_turned_away(mon
 
     async def muse(session, request):
         if request == 1:
-            turned_away = {"robot": "play", "audio": "tts:" + reachy_voice.QUEUE_FULL_CUE}
+            turned_away = {"robot": "play", "audio": "tts:" + reachy_voice.BUSY_CUE}
             await rig.wait_until_or_timeout(lambda: turned_away in rig.recording.events, 10)
             await session.answer(request, "Sunny and warm all day. [reachy:happy]")
         else:
@@ -751,7 +751,7 @@ def test_answer_held_for_ongoing_talk_is_spoken_after_the_hold_limit_and_turns_t
         event["audio"] for event in record["events"][:talk_ended[0]] if event.get("robot") == "play"]
     plays = [event["audio"] for event in record["events"] if event.get("robot") == "play"]
     first_job = plays[:plays.index("tts:It was a close one.")]
-    assert first_job.count("tts:" + reachy_voice.QUEUE_FULL_CUE) == 1
+    assert first_job.count("tts:" + reachy_voice.BUSY_CUE) == 1
 
 
 def test_late_answer_is_introduced_with_the_requests_own_words(monkeypatch):
