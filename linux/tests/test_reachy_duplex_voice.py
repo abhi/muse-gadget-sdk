@@ -1,12 +1,15 @@
 """Continuous authorized input with one owner of Muse turns and speech."""
 
 import asyncio
+from dataclasses import replace
 import io
 import wave
 
 import pytest
 
 from musegadget import reachy_voice, voice_audio
+from musegadget.reachy_capabilities import ReplyStyle
+from musegadget.reachy_local_backends import LocalHearing, robot_backends
 from musegadget.reachy_voice import TurnOutcome, VoiceConversation
 from musegadget.wake_word import WakeDetection
 from test_reachy_voice import FakeHardware, FakeSession, bounded, cancel_task, chat_event, sentence_frame
@@ -28,7 +31,7 @@ def duplex(monkeypatch):
             return np.frombuffer(source.readframes(source.getnframes()), dtype="<i2").copy()
 
     async def scenario(run, *, echo=True, wake=False, real_turn=False, speech=None, silence_s=.1,
-                       wake_delay_feeds=0, hold_recognition=False, transcriber=None):
+                       wake_delay_feeds=0, hold_recognition=False, transcriber=None, owned=False):
         loop = asyncio.get_running_loop()
         ready = asyncio.Event()
         consumer_ready = asyncio.Event()
@@ -120,8 +123,12 @@ def duplex(monkeypatch):
                 return "Question one."
 
         options = {} if silence_s is None else {"silence_s": silence_s}
-        conversation = VoiceConversation(session, hardware, **options, speech=speech or object(),
-                                         transcriber=transcriber or Recognition(), speech_gate=Vad(),
+        backends = robot_backends(session, speech=speech or (object() if wake else None),
+                                  transcriber=transcriber or Recognition())
+        if owned:
+            options.update(session_id="robot-chat", owns_chat=True)
+            session.acknowledgement["response"]["result"].update(session_id="robot-chat", is_thread=True)
+        conversation = VoiceConversation(session, hardware, **options, backends=backends, speech_gate=Vad(),
                                          wake_detector=Wake() if wake else None)
 
         async def turn(wav, **options):
@@ -142,7 +149,7 @@ def duplex(monkeypatch):
             # These scenarios replace the whole Muse turn with the controlled
             # function below.  Do not also start the production ASR preprocessor;
             # the replacement records each admitted WAV itself.
-            conversation.transcriber = None
+            conversation.backends = replace(backends, hearing=LocalHearing())
             conversation.turn = turn
         microphone = asyncio.create_task(conversation._microphone())
 
@@ -285,7 +292,7 @@ def test_actual_playback_accepts_input_only_with_exact_echo_capability(duplex, e
             else:
                 await speaking
 
-    asyncio.run(bounded(duplex(run, echo=echo, speech=Speech())))
+    asyncio.run(bounded(duplex(run, echo=echo, speech=Speech(), owned=True)))
 
 
 def test_wake_privacy_and_continuous_followups_while_muse_waits(duplex):
@@ -418,12 +425,13 @@ def test_full_queue_preserves_eight_questions_and_speaks_one_retry_notice(duplex
 
     async def run(ctx):
         acknowledged = [asyncio.Event() for _ in range(9)]
-        ctx.conversation.stream_replies = True
+        ctx.conversation.backends = replace(ctx.conversation.backends, reply_style=ReplyStyle.EXPRESSIVE_JSON)
 
         async def acknowledge(session):
             index = len(session.setup_messages) - 1
             session.acknowledgement = {"ok": True, "status": 200,
-                                       "response": {"message_id": f"user-{index + 1}"}}
+                                       "response": {"message_id": f"user-{index + 1}",
+                                                    "session_id": "robot-chat", "is_thread": True}}
             acknowledged[index].set()
 
         ctx.session.send_hook = acknowledge
@@ -461,4 +469,4 @@ def test_full_queue_preserves_eight_questions_and_speaks_one_retry_notice(duplex
         finally:
             await cancel_task(subscriber)
 
-    asyncio.run(bounded(duplex(run, real_turn=True, speech=Speech())))
+    asyncio.run(bounded(duplex(run, real_turn=True, speech=Speech(), owned=True)))

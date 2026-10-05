@@ -8,6 +8,7 @@ import asyncio
 import pytest
 
 from musegadget import reachy_voice
+from musegadget.reachy_local_backends import robot_backends
 from musegadget.reachy_voice import TurnOutcome, VoiceConversation
 
 
@@ -65,11 +66,9 @@ async def owned_turn(text):
     session = Session()
     conversation = VoiceConversation(
         session,
-        Hardware(),
+        Hardware(), backends=robot_backends(session, speech=object(), transcriber=object()),
         session_id="owned-chat",
         owns_chat=True,
-        speech=object(),
-        transcriber=object(),
         wake_detector=type("Wake", (), {"phrase": "hey muse"})(),
     )
     session.conversation = conversation
@@ -105,9 +104,12 @@ def test_owned_microphone_does_not_send_expression_bootstrap(owns_chat, expected
     pytest.importorskip("av")
     async def check():
         calls = []
+        session = Session()
         conversation = VoiceConversation(
-            Session(), Hardware(), session_id="owned-chat" if owns_chat else None,
-            owns_chat=owns_chat, speech=object(), expressive_replies=True,
+            session, Hardware(),
+                                         backends=robot_backends(session, speech=object()),
+                                         session_id="owned-chat" if owns_chat else None,
+            owns_chat=owns_chat,
         )
 
         async def turn(wav, **options):

@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from musegadget import reachy_voice
 from musegadget.identity import Identity
 from musegadget.link_client import Outcome
+from musegadget.reachy_local_backends import robot_backends
 from test_reachy_voice import FakeHardware, FakeSession, chat_event, mp3_tone, sentence_frame  # noqa: F401
 
 np = pytest.importorskip("numpy")
@@ -202,16 +204,19 @@ class Rig:
         self.hardware = PinHardware(self.recording)
         self.session = None
 
-    def service(self, muse, *, mp3=b"", owned=True, rejected=False, **fields):
+    def service(self, muse, *, mp3=b"", owned=True, rejected=False, speech=None, progress_speech=None,
+                transcriber=None, stream_replies=False, **fields):
         self.session = PinSession(self.recording, muse, mp3=mp3, owned=owned, rejected=rejected)
         self.monkeypatch.setattr(reachy_voice, "LinkSession", lambda **_: self.session)
 
         async def prepare_chat(session, vm):
             return "robot-chat"
+        backends = functools.partial(robot_backends, speech=speech, progress_speech=progress_speech,
+                                     transcriber=transcriber, stream_replies=stream_replies)
         return reachy_voice.ReachyService(
             identity=Identity("02:00:00:ab:cd:ef"), executor=self.hardware, silence_s=.2,
-            speech_gate=Vad(), **({"prepare_chat": prepare_chat, "owns_chat": True} if owned else {}),
-            **fields)
+            speech_gate=Vad(), backends=backends,
+            **({"prepare_chat": prepare_chat, "owns_chat": True} if owned else {}), **fields)
 
     def voice(self, name="tts"):
         return TextCodedVoice(self.recording, name)

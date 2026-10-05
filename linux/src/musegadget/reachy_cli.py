@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -340,6 +341,7 @@ def _hardware(args, *, motion=True):
 
 
 async def run(args) -> int:
+    from musegadget.reachy_local_backends import robot_backends
     from musegadget.reachy_voice import ReachyService
 
     if not config.load_json(config.PAIRING_FILE):
@@ -418,10 +420,12 @@ async def run(args) -> int:
                                display_name="Reachy Mini", session_id=session_id,
                                prepare_chat=dedicated_chat.prepare if dedicated_chat else None,
                                owns_chat=dedicated_chat is not None,
-                               silence_s=args.silence, speech=speech, progress_speech=progress_speech,
-                               transcriber=transcriber,
-                               audio_diagnostics=args.audio_diagnostics,
-                               stream_replies=args.stream_replies, wake_detector=wake_detector,
+                               silence_s=args.silence,
+                               backends=functools.partial(robot_backends, speech=speech,
+                                                          progress_speech=progress_speech,
+                                                          transcriber=transcriber,
+                                                          stream_replies=args.stream_replies),
+                               audio_diagnostics=args.audio_diagnostics, wake_detector=wake_detector,
                                wake_timeout_s=args.wake_timeout, speech_gate=speech_gate)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):

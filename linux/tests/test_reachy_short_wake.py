@@ -7,6 +7,7 @@ import wave
 import pytest
 
 from musegadget import reachy_voice, voice_audio
+from musegadget.reachy_local_backends import robot_backends
 from musegadget.reachy_voice import VoiceConversation
 from test_reachy_voice import FakeHardware, FakeSession, bounded, cancel_task
 
@@ -80,9 +81,11 @@ def wake_scenario(monkeypatch):
         session = FakeSession(send_hook=request)
         session.chat_subscribed.set()
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=Recognition(),
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=Recognition()),
                                          wake_detector=Wake(), silence_s=.14, wake_timeout_s=timeout)
-        conversation._acknowledgement_audio["Yes?"] = (np.full(80, .1, np.float32),)
+        conversation.backends.voice.phrases["Yes?"] = (np.full(80, .1, np.float32),)
         actual_turn = conversation.turn
 
         async def turn(wav, **options):
@@ -219,11 +222,11 @@ def test_capture_gap_during_asr_preserves_the_inflight_boundary(wake_scenario, c
     async def run(conversation, session, hardware, recognition, feed):
         first_wake = asyncio.create_task(feed(.25, 14))
         try:
-            await conversation.transcriber.entered.wait()
+            await conversation.backends.hearing.transcriber.entered.wait()
             await feed.capture_gap()
             while "lost continuity" not in caplog.text:
                 await asyncio.sleep(.001)
-            conversation.transcriber.proceed.set()
+            conversation.backends.hearing.transcriber.proceed.set()
             await first_wake
             assert recognition == ["Unconfirmed private speech."]
             assert session.setup_messages == []

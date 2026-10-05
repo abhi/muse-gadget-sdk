@@ -13,7 +13,9 @@ import wave
 
 import pytest
 
-from musegadget import reachy_voice
+from musegadget import reachy_local_backends, reachy_voice
+from musegadget.reachy_capabilities import ReplyStyle
+from musegadget.reachy_local_backends import robot_backends
 from musegadget.reachy_progress import BackendActivity, BackendStatus
 from musegadget.reachy_voice import (
     BackendStatusSegment, ProgressSegment, ReplayScope, ReplyTracker, SpeechSegment, TaskFinished, TurnOutcome,
@@ -34,7 +36,7 @@ def status_segment(activity=None, phase="working"):
 
 
 def owned_tracker(scope=None, user_id="user-1"):
-    tracker = ReplyTracker("robot-chat", stream_replies=True, owns_chat=True, replay_scope=scope)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON, owns_chat=True, replay_scope=scope)
     tracker.acknowledge({"message_id": user_id, "session_id": "robot-chat", "is_thread": True})
     return tracker
 
@@ -47,7 +49,7 @@ def test_retired_turn_ids_reject_late_status_frames_and_terminals_before_ack():
                          activity_code="working", activity_text="Searching web"))
     old.event(chat_event("delta.text_append", "old-answer", parent=None, text=progress_frame()))
     old.retire()
-    current = ReplyTracker("robot-chat", stream_replies=True, owns_chat=True, replay_scope=scope)
+    current = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON, owns_chat=True, replay_scope=scope)
     events = [
         chat_event("agent.status", "old-worker", parent=None,
                    activity_code="working", activity_text="Searching web"),
@@ -170,7 +172,7 @@ def test_owned_active_id_memory_is_bounded():
 def test_current_ack_can_authorize_a_retired_parent_without_unretiring_old_messages(before_ack):
     scope = ReplayScope()
     scope.retire([("message", "acknowledged-root")])
-    tracker = ReplyTracker("robot-chat", stream_replies=True, owns_chat=True, replay_scope=scope)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON, owns_chat=True, replay_scope=scope)
     event = chat_event("delta.text_append", "current-reply", parent="acknowledged-root", text=progress_frame())
     ack = {"message_id": "user-2", "reply_to_message_id": "acknowledged-root",
            "session_id": "robot-chat", "is_thread": True}
@@ -193,7 +195,9 @@ def test_owned_ack_identifiers_obey_retirement_memory_limit():
 def test_idle_subscription_snapshots_are_retired_before_the_next_ack():
     async def scenario():
         session = FakeSession()
-        conversation = VoiceConversation(session, FakeHardware(), session_id="robot-chat", owns_chat=True)
+        conversation = VoiceConversation(session, FakeHardware(),
+                                         backends=robot_backends(session),
+                                         session_id="robot-chat", owns_chat=True)
         subscriber = asyncio.create_task(conversation._subscribe())
         try:
             await session.events.put(chat_event("task.status", parent=None, task_id="idle-task", status="completed"))
@@ -222,7 +226,10 @@ def test_cancelled_unacknowledged_owned_turn_retires_pending_ids(monkeypatch):
             async def send_voice(self, wav, session_id, **kwargs):
                 started.set()
                 await asyncio.Event().wait()
-        conversation = VoiceConversation(BlockedSession(), FakeHardware(), session_id="robot-chat", owns_chat=True)
+        session = BlockedSession()
+        conversation = VoiceConversation(session, FakeHardware(),
+                                         backends=robot_backends(session),
+                                         session_id="robot-chat", owns_chat=True)
         turn = asyncio.create_task(conversation.turn(b"wav"))
         await started.wait()
         tracker = conversation.tracker
@@ -235,7 +242,7 @@ def test_cancelled_unacknowledged_owned_turn_retires_pending_ids(monkeypatch):
 
 
 def test_progress_is_ephemeral_and_never_counts_as_an_answer():
-    tracker = ReplyTracker("robot-chat", stream_replies=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON)
     tracker.acknowledge({"message_id": "user-1"})
     progress = progress_frame()
     assert tracker.event(chat_event("delta.text_append", "reply-1", text=progress)) == [
@@ -250,7 +257,7 @@ def test_progress_is_ephemeral_and_never_counts_as_an_answer():
 
 @pytest.mark.parametrize("parent", [None, "reply-1"])
 def test_parentless_or_self_parent_progress_is_not_current_turn_proof(parent):
-    tracker = ReplyTracker("robot-chat", stream_replies=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON)
     tracker.acknowledge({"message_id": "user-1"})
     tracker.event(chat_event("delta.message_start", "reply-1", parent=None))
     assert tracker.event(chat_event("delta.text_append", "reply-1", parent=parent,
@@ -259,7 +266,7 @@ def test_parentless_or_self_parent_progress_is_not_current_turn_proof(parent):
 
 
 def test_only_explicitly_linked_public_status_can_offer_a_stage():
-    tracker = ReplyTracker("robot-chat", stream_replies=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON)
     tracker.acknowledge({"message_id": "user-1"})
     assert tracker.event(chat_event("agent.status", parent=None,
                                     activity_text="Searching flights", activity_code="working")) == []
@@ -276,7 +283,7 @@ def test_only_explicitly_linked_public_status_can_offer_a_stage():
 
 @pytest.mark.parametrize("parent", [None, "reply-1"])
 def test_dedicated_side_chat_attributes_exact_session_progress_without_parent_ancestry(parent):
-    tracker = ReplyTracker("robot-chat", stream_replies=True, owns_chat=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON, owns_chat=True)
     tracker.acknowledge({"message_id": "user-1", "session_id": "robot-chat", "is_thread": True})
     assert tracker.event(chat_event("delta.text_append", "reply-1", parent=parent,
                                     text=progress_frame())) == [ProgressSegment("Looking at flights now.")]
@@ -292,7 +299,7 @@ def test_dedicated_side_chat_attributes_exact_session_progress_without_parent_an
 
 @pytest.mark.parametrize("session_id", [None, "main", "other-device-chat"])
 def test_dedicated_side_chat_never_attributes_other_or_missing_session_progress(session_id):
-    tracker = ReplyTracker("robot-chat", stream_replies=True, owns_chat=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON, owns_chat=True)
     tracker.acknowledge({"message_id": "user-1", "session_id": "robot-chat", "is_thread": True})
     assert tracker.event(chat_event("agent.status", parent=None, session_id=session_id,
                                     activity_text="Searching web", activity_code="working")) == []
@@ -316,8 +323,11 @@ def test_owned_chat_backend_stages_are_spoken_once_and_answer_stops_them(monkeyp
     from musegadget.reachy_progress import ProgressPlan
     clock = 0.0
     monkeypatch.setattr(reachy_voice.time, "monotonic", lambda: clock)
-    conversation = VoiceConversation(FakeSession(), FakeHardware(), session_id="robot-chat", owns_chat=True)
-    tracker = ReplyTracker("robot-chat", stream_replies=True, owns_chat=True)
+    session = FakeSession()
+    conversation = VoiceConversation(session, FakeHardware(),
+                                     backends=robot_backends(session),
+                                     session_id="robot-chat", owns_chat=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON, owns_chat=True)
     tracker.acknowledge({"message_id": "user-1", "session_id": "robot-chat", "is_thread": True})
     conversation._progress = ProgressPlan("Look up the documentation.", 0)
     clock = 8.153
@@ -345,7 +355,10 @@ def test_lunch_request_reports_working_phase_before_delayed_answer(monkeypatch):
     from musegadget.reachy_progress import ProgressPlan
     clock = 0.0
     monkeypatch.setattr(reachy_voice.time, "monotonic", lambda: clock)
-    conversation = VoiceConversation(FakeSession(), FakeHardware(), session_id="robot-chat", owns_chat=True)
+    session = FakeSession()
+    conversation = VoiceConversation(session, FakeHardware(),
+                                     backends=robot_backends(session),
+                                     session_id="robot-chat", owns_chat=True)
     tracker = owned_tracker()
     conversation._progress = ProgressPlan("What should I cook for lunch?", 0)
     clock = 2
@@ -369,7 +382,10 @@ def test_early_public_milestone_survives_the_first_twenty_second_cue(monkeypatch
     from musegadget.reachy_progress import ProgressPlan
     clock = 0.0
     monkeypatch.setattr(reachy_voice.time, "monotonic", lambda: clock)
-    conversation = VoiceConversation(FakeSession(), FakeHardware(), session_id="robot-chat", owns_chat=True)
+    session = FakeSession()
+    conversation = VoiceConversation(session, FakeHardware(),
+                                     backends=robot_backends(session),
+                                     session_id="robot-chat", owns_chat=True)
     tracker = owned_tracker()
     conversation._progress = ProgressPlan("Find a recipe.", 0)
     clock = 1
@@ -383,7 +399,7 @@ def test_early_public_milestone_survives_the_first_twenty_second_cue(monkeypatch
 
 
 def test_progress_only_final_does_not_mark_reply_played_or_complete():
-    tracker = ReplyTracker("robot-chat", stream_replies=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON)
     tracker.acknowledge({"message_id": "user-1"})
     tracker.event(chat_event("delta.text_append", "reply-1", text=progress_frame()))
     assert tracker.event(chat_event("delta.message_done", "reply-1", content=progress_frame())) == []
@@ -397,7 +413,7 @@ def test_progress_playback_is_preempted_and_closed_before_answer_or_turn_cleanup
         monkeypatch, streaming_speech, ending):
     np = pytest.importorskip("numpy")
     from musegadget.reachy_progress import ProgressPlan
-    monkeypatch.setattr(reachy_voice, "ProgressPlan",
+    monkeypatch.setattr(reachy_local_backends, "ProgressPlan",
                         lambda text, started: ProgressPlan(text, started, first_delay_s=0))
 
     async def scenario():
@@ -421,9 +437,11 @@ def test_progress_playback_is_preempted_and_closed_before_answer_or_turn_cleanup
 
         session = FakeSession()
         speech = AnswerSpeech(hardware)
-        conversation = VoiceConversation(session, hardware, session_id="robot-chat", speech=speech,
-                                         stream_replies=True, expressive_replies=True,
-                                         progress_speech=ProgressSpeech(),
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech,
+                                                                 progress_speech=ProgressSpeech(),
+                                                                 stream_replies=True),
+                                         session_id="robot-chat",
                                          reply_timeout_s=.25 if ending == "timeout" else 3)
         subscriber = asyncio.create_task(conversation._subscribe())
         turn = asyncio.create_task(conversation.turn(b"voice"))
@@ -464,7 +482,7 @@ def test_progress_playback_is_preempted_and_closed_before_answer_or_turn_cleanup
 
 def test_answer_queued_before_progress_due_suppresses_the_cue(monkeypatch, streaming_speech):
     from musegadget.reachy_progress import ProgressPlan
-    monkeypatch.setattr(reachy_voice, "ProgressPlan",
+    monkeypatch.setattr(reachy_local_backends, "ProgressPlan",
                         lambda text, started: ProgressPlan(text, started, first_delay_s=0))
 
     async def scenario():
@@ -484,8 +502,11 @@ def test_answer_queued_before_progress_due_suppresses_the_cue(monkeypatch, strea
             await session.delivered.get()
 
         session = FakeSession(send_hook=send)
-        conversation = VoiceConversation(session, hardware, session_id="robot-chat", speech=speech,
-                                         stream_replies=True, progress_speech=ProgressSpeech())
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech,
+                                                                 progress_speech=ProgressSpeech(),
+                                                                 stream_replies=True),
+                                         session_id="robot-chat")
         subscriber = asyncio.create_task(conversation._subscribe())
         try:
             assert await conversation.turn(b"voice") is TurnOutcome.ACCEPTED
@@ -504,7 +525,7 @@ def test_progress_clock_starts_after_muse_acknowledges(monkeypatch, streaming_sp
         origins.append(started)
         return ProgressPlan(text, started)
 
-    monkeypatch.setattr(reachy_voice, "ProgressPlan", make_plan)
+    monkeypatch.setattr(reachy_local_backends, "ProgressPlan", make_plan)
 
     async def scenario():
         hardware = FakeHardware()
@@ -520,8 +541,10 @@ def test_progress_clock_starts_after_muse_acknowledges(monkeypatch, streaming_sp
             acknowledged.append(time.monotonic())
 
         session = FakeSession(send_hook=send)
-        conversation = VoiceConversation(session, hardware, session_id="robot-chat", speech=speech,
-                                         stream_replies=True, progress_speech=speech)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech,
+                                                                 progress_speech=speech, stream_replies=True),
+                                         session_id="robot-chat")
         subscriber = asyncio.create_task(conversation._subscribe())
         try:
             await conversation.turn(b"voice")
@@ -534,7 +557,7 @@ def test_progress_clock_starts_after_muse_acknowledges(monkeypatch, streaming_sp
 def test_completed_progress_hardware_error_survives_answer_race(monkeypatch, streaming_speech):
     from musegadget.reachy_hardware import ReachyHardwareError
     from musegadget.reachy_progress import ProgressPlan
-    monkeypatch.setattr(reachy_voice, "ProgressPlan",
+    monkeypatch.setattr(reachy_local_backends, "ProgressPlan",
                         lambda text, started: ProgressPlan(text, started, first_delay_s=0))
 
     async def scenario():
@@ -549,8 +572,11 @@ def test_completed_progress_hardware_error_survives_answer_race(monkeypatch, str
 
         session = FakeSession()
         speech = streaming_speech(hardware)
-        conversation = VoiceConversation(session, hardware, session_id="robot-chat", speech=speech,
-                                         stream_replies=True, progress_speech=ProgressSpeech())
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech,
+                                                                 progress_speech=ProgressSpeech(),
+                                                                 stream_replies=True),
+                                         session_id="robot-chat")
         subscriber = asyncio.create_task(conversation._subscribe())
         turn = asyncio.create_task(conversation.turn(b"voice"))
         try:
@@ -574,7 +600,7 @@ def test_preemption_finishes_pending_hardware_call_before_flush_and_answer(
     np = pytest.importorskip("numpy")
     from musegadget.reachy_hardware import ReachyHardwareError
     from musegadget.reachy_progress import ProgressPlan
-    monkeypatch.setattr(reachy_voice, "ProgressPlan",
+    monkeypatch.setattr(reachy_local_backends, "ProgressPlan",
                         lambda text, started: ProgressPlan(text, started, first_delay_s=0))
 
     async def scenario():
@@ -612,8 +638,11 @@ def test_preemption_finishes_pending_hardware_call_before_flush_and_answer(
         hardware = Hardware()
         speech = streaming_speech(hardware)
         session = FakeSession()
-        conversation = VoiceConversation(session, hardware, session_id="robot-chat", speech=speech,
-                                         stream_replies=True, progress_speech=ProgressSpeech())
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech,
+                                                                 progress_speech=ProgressSpeech(),
+                                                                 stream_replies=True),
+                                         session_id="robot-chat")
         subscriber = asyncio.create_task(conversation._subscribe())
         turn = asyncio.create_task(conversation.turn(b"voice"))
         try:
@@ -655,7 +684,9 @@ def test_repeated_cancellation_still_joins_pending_progress_push(streaming_speec
 
         hardware = Hardware()
         speech = streaming_speech(hardware)
-        conversation = VoiceConversation(FakeSession(), hardware, speech=speech)
+        session = FakeSession()
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech))
         task = asyncio.create_task(conversation._speak(None, text="Waiting.", state="thinking",
                                                        stream_segment=True, progress=True))
         try:
@@ -686,7 +717,9 @@ def test_queued_notice_waits_for_paused_direct_acknowledgement_or_progress(progr
         direct_audio = np.full(640, .1, dtype=np.float32)
         notice_audio = np.full(640, .2, dtype=np.float32)
         hardware = FakeHardware()
-        conversation = VoiceConversation(FakeSession(), hardware, speech=object())
+        session = FakeSession()
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object()))
         conversation._playback.set_user_speaking(True)
         speaker = asyncio.create_task(conversation._play_output())
         direct = asyncio.create_task(conversation._speak(None, text='Public cue.',
@@ -733,7 +766,8 @@ def test_waiting_or_failed_later_turn_cannot_flush_an_earlier_answer(failed_turn
 
         hardware = FakeHardware()
         session = FakeSession(acknowledgement={'ok': False, 'status': 403})
-        conversation = VoiceConversation(session, hardware, speech=Speech())
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=Speech()))
         owner = asyncio.create_task(conversation._speak(None, text='Earlier answer.',
                                                        stream_segment=True))
         try:
@@ -766,7 +800,9 @@ def test_idle_cleanup_cannot_join_a_speaker_lock_handoff():
 
     async def scenario():
         hardware = FakeHardware()
-        conversation = VoiceConversation(FakeSession(), hardware, speech=object())
+        session = FakeSession()
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object()))
         await conversation._speaker_lock.acquire()
         waiting = asyncio.create_task(conversation._speak(None, text='Public answer.',
             stream_segment=True, prepared_audio=(np.full(640, .1, dtype=np.float32),)))
@@ -788,8 +824,9 @@ def test_idle_cleanup_cannot_join_a_speaker_lock_handoff():
 def test_failed_deferred_turn_does_not_flush_the_output_pipeline():
     async def scenario():
         hardware = FakeHardware()
-        conversation = VoiceConversation(FakeSession(acknowledgement={'ok': False, 'status': 403}),
-                                         hardware)
+        session = FakeSession(acknowledgement={'ok': False, 'status': 403})
+        conversation = VoiceConversation(session,
+                                         hardware, backends=robot_backends(session))
         with pytest.raises(ConnectionError, match='rejected'):
             await conversation.turn(b'public-waveform', defer_playback=True)
         assert hardware.cleared == 0 and not conversation._muted
@@ -806,17 +843,19 @@ def test_standard_progress_audio_is_cached_without_playback_or_answer_synthesis(
         progress = streaming_speech(hardware)
         # The fake voice records poses; preparation itself must not move the hardware.
         hardware.state_expressions.append(("idle", None))
-        conversation = VoiceConversation(FakeSession(), hardware, speech=answer,
-                                         progress_speech=progress)
+        session = FakeSession()
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=answer,
+                                                                 progress_speech=progress))
         await conversation.prepare_acknowledgement()
         assert progress.requests == list(PUBLIC_PROGRESS_PHRASES)
         assert progress.closed == progress.requests and answer.requests == []
-        assert set(conversation._progress_audio) == set(PUBLIC_PROGRESS_PHRASES)
+        assert set(conversation.backends.progress_voice.phrases) == set(PUBLIC_PROGRESS_PHRASES)
         assert not hardware.states and not hardware.played
         for phrase in PUBLIC_PROGRESS_PHRASES:
             await conversation._speak(None, text=phrase, state="thinking", stream_segment=True,
-                                      prepared_audio=conversation._progress_audio[phrase],
-                                      speech_backend=progress, progress=True)
+                                      prepared_audio=conversation.backends.progress_voice.phrases[phrase],
+                                      voice=conversation.backends.progress_voice, progress=True)
         assert progress.requests == list(PUBLIC_PROGRESS_PHRASES)
         assert len(hardware.played) == len(PUBLIC_PROGRESS_PHRASES)
         assert hardware.progress_cues == len(PUBLIC_PROGRESS_PHRASES)
@@ -875,8 +914,9 @@ async def streaming_turn(script, speech, hardware, *, before_ack=False):
             producers.append(asyncio.create_task(deliver(session)))
 
     session = FakeSession(send_hook=send)
-    conversation = VoiceConversation(session, hardware, session_id="robot-chat", speech=speech,
-                                     stream_replies=True, expressive_replies=True, reply_timeout_s=3)
+    conversation = VoiceConversation(session, hardware,
+                                     backends=robot_backends(session, speech=speech, stream_replies=True),
+                                     session_id="robot-chat", reply_timeout_s=3)
     subscriber = asyncio.create_task(conversation._subscribe())
     try:
         await session.chat_subscribed.wait()
@@ -894,7 +934,7 @@ async def streaming_turn(script, speech, hardware, *, before_ack=False):
 
 
 def test_protocol_segments_are_immutable_indexed_and_final_prefix_does_not_repeat():
-    tracker = ReplyTracker("robot-chat", stream_replies=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON)
     tracker.acknowledge({"message_id": "user-1"})
     first = sentence_frame("Hello!", "happy")
     assert tracker.event(chat_event("delta.text_append", "reply-1", text=first)) == [
@@ -906,7 +946,7 @@ def test_protocol_segments_are_immutable_indexed_and_final_prefix_does_not_repea
 
 
 def test_parentless_streaming_preserves_session_and_explicit_parent_filters():
-    tracker = ReplyTracker("robot-chat", stream_replies=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON)
     tracker.acknowledge({"message_id": "user-1"})
     text = sentence_frame("Hello.")
     assert tracker.event(chat_event("delta.text_append", "wrong-session", parent=None,
@@ -918,7 +958,7 @@ def test_parentless_streaming_preserves_session_and_explicit_parent_filters():
 
 
 def test_streaming_holds_later_messages_until_earlier_message_finishes():
-    tracker = ReplyTracker("robot-chat", stream_replies=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON)
     tracker.acknowledge({"message_id": "user-1"})
     first = sentence_frame("First.")
     second = sentence_frame("Second.", "curious")
@@ -930,7 +970,7 @@ def test_streaming_holds_later_messages_until_earlier_message_finishes():
 
 @pytest.mark.parametrize("text", ["é" * 33000, sentence_frame("Hi.") * 33])
 def test_streaming_text_and_segment_batches_are_bounded(text):
-    tracker = ReplyTracker("robot-chat", stream_replies=True)
+    tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON)
     tracker.acknowledge({"message_id": "user-1"})
     with pytest.raises(ValueError, match="64 KiB|too many queued"):
         tracker.event(chat_event("delta.text_append", "reply-1", text=text))
@@ -1066,8 +1106,10 @@ def test_cancelling_streaming_closes_active_speech_before_capture_resumes(stream
             await session.delivered.get()
 
         hardware = FakeHardware()
-        conversation = VoiceConversation(FakeSession(send_hook=send), hardware, speech=StalledSpeech(),
-                                         stream_replies=True)
+        muse = FakeSession(send_hook=send)
+        conversation = VoiceConversation(muse, hardware,
+                                         backends=robot_backends(muse, speech=StalledSpeech(),
+                                                                 stream_replies=True))
         subscriber = asyncio.create_task(conversation._subscribe())
         await conversation.session.chat_subscribed.wait()
         turn = asyncio.create_task(conversation.turn(b"voice"))
@@ -1081,7 +1123,9 @@ def test_cancelling_streaming_closes_active_speech_before_capture_resumes(stream
 
 def test_streaming_requires_local_speech():
     with pytest.raises(ValueError, match="requires local speech"):
-        VoiceConversation(FakeSession(), FakeHardware(), stream_replies=True)
+        session = FakeSession()
+        VoiceConversation(session, FakeHardware(),
+                          backends=robot_backends(session, stream_replies=True))
 
 
 @pytest.mark.parametrize("mode,expected", [("both", "Both antennas are enabled"),
@@ -1093,7 +1137,9 @@ def test_muse_robot_awareness_reflects_antenna_settings_without_capture_mechanic
     hardware.antenna_mode = mode
     hardware.motion_enabled = True
     wake = type("Wake", (), {"phrase": "hey muse"})()
-    conversation = VoiceConversation(FakeSession(), hardware, speech=object(), transcriber=object(),
+    session = FakeSession()
+    conversation = VoiceConversation(session, hardware,
+                                     backends=robot_backends(session, speech=object(), transcriber=object()),
                                      wake_detector=wake, wake_timeout_s=10)
     context = conversation._voice_context()
     assert expected in context
@@ -1107,7 +1153,8 @@ def test_muse_robot_awareness_reflects_antenna_settings_without_capture_mechanic
 def test_muse_robot_awareness_reports_disabled_movement():
     hardware = FakeHardware()
     hardware.motion_enabled = False
-    context = VoiceConversation(FakeSession(), hardware)._voice_context()
+    session = FakeSession()
+    context = VoiceConversation(session, hardware, backends=robot_backends(session))._voice_context()
     assert "Movement is disabled in this session" in context
     assert "Both antennas are enabled" not in context
 
@@ -1115,7 +1162,8 @@ def test_muse_robot_awareness_reports_disabled_movement():
 def test_muse_knows_local_face_follow_does_not_supply_camera_vision_or_identity():
     hardware = FakeHardware()
     hardware.face_tracking_enabled = True
-    context = VoiceConversation(FakeSession(), hardware)._voice_context()
+    session = FakeSession()
+    context = VoiceConversation(session, hardware, backends=robot_backends(session))._voice_context()
     assert "Local face tracking is enabled" in context
     assert "camera images stay on Reachy" in context
     assert "no visual information or identity recognition" in context
@@ -1217,8 +1265,9 @@ def test_cancelled_turn_reaps_current_and_lookahead_before_microphone_reopens(pr
             await session.events.put(chat_event("delta.text_append", "reply-1", text=frames))
             await session.delivered.get()
 
-        conversation = VoiceConversation(FakeSession(send_hook=send), hardware,
-                                         speech=speech, stream_replies=True)
+        muse = FakeSession(send_hook=send)
+        conversation = VoiceConversation(muse, hardware,
+                                         backends=robot_backends(muse, speech=speech, stream_replies=True))
         subscriber = asyncio.create_task(conversation._subscribe())
         await conversation.session.chat_subscribed.wait()
         turn = asyncio.create_task(conversation.turn(b"voice"))
@@ -1235,7 +1284,7 @@ def test_authoritative_revision_during_progress_shutdown_speaks_only_replacement
         monkeypatch, prepared_speech):
     np = pytest.importorskip("numpy")
     from musegadget.reachy_progress import ProgressPlan
-    monkeypatch.setattr(reachy_voice, "ProgressPlan",
+    monkeypatch.setattr(reachy_local_backends, "ProgressPlan",
                         lambda text, started: ProgressPlan(text, started, first_delay_s=0))
 
     async def scenario():
@@ -1253,8 +1302,11 @@ def test_authoritative_revision_during_progress_shutdown_speaks_only_replacement
         hardware = FakeHardware()
         speech = prepared_speech(hardware)
         session = FakeSession()
-        conversation = VoiceConversation(session, hardware, speech=speech, stream_replies=True,
-                                         progress_speech=ProgressSpeech(), reply_timeout_s=3)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech,
+                                                                 progress_speech=ProgressSpeech(),
+                                                                 stream_replies=True),
+                                         reply_timeout_s=3)
         subscriber = asyncio.create_task(conversation._subscribe())
         await session.chat_subscribed.wait()
         turn = asyncio.create_task(conversation.turn(b"voice"))
@@ -1448,8 +1500,8 @@ def test_local_voice_speaks_muse_text_and_executes_its_expression(monkeypatch):
         speech = LocalSpeech()
         session = FakeSession(send_hook=reply)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=speech,
-                                         expressive_replies=True, reply_timeout_s=2)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech), reply_timeout_s=2)
         subscriber = asyncio.create_task(conversation._subscribe())
         await session.chat_subscribed.wait()
         await conversation.turn(b"recording")
@@ -1485,7 +1537,8 @@ def test_expression_setup_uses_a_separate_text_turn_and_speaks_readiness(monkeyp
 
         session = FakeSession(send_hook=reply)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=LocalSpeech(), expressive_replies=True)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=LocalSpeech()))
         subscriber = asyncio.create_task(conversation._subscribe())
         await session.chat_subscribed.wait()
         await conversation.turn(None)
@@ -1524,8 +1577,9 @@ def test_local_recognition_sends_words_to_muse_and_ignores_empty_speech(monkeypa
 
         session = FakeSession(send_hook=reply)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=LocalSpeech(),
-                                         transcriber=LocalRecognition(), expressive_replies=True)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=LocalSpeech(),
+                                                                 transcriber=LocalRecognition()))
         subscriber = asyncio.create_task(conversation._subscribe())
         await session.chat_subscribed.wait()
         await conversation.turn(b"captured microphone audio")
@@ -1564,7 +1618,8 @@ def test_empty_muse_reply_announces_the_problem_and_resumes_without_reconnecting
 
         session = FakeSession(send_hook=reply)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=LocalSpeech())
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=LocalSpeech()))
         subscriber = asyncio.create_task(conversation._subscribe())
         await session.chat_subscribed.wait()
         await conversation.turn(b"voice")
@@ -1589,7 +1644,9 @@ def test_reply_emotion_is_present_during_speech_without_a_delayed_extra_move(mon
 
     async def scenario():
         hardware = FakeHardware()
-        conversation = VoiceConversation(FakeSession(), hardware, speech=LocalSpeech(), expressive_replies=True)
+        session = FakeSession()
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=LocalSpeech()))
         conversation.tracker = ReplyTracker()
         conversation.tracker.messages["reply-1"] = {"text": "That's wonderful. [reachy:happy]"}
         await conversation._speak("reply-1")
@@ -1633,10 +1690,11 @@ def test_contextual_acknowledgement_waits_for_words_and_skips_unmatched_input(mo
             await session.delivered.get()
 
         session = FakeSession(send_hook=reply)
-        conversation = VoiceConversation(session, hardware, speech=LocalSpeech(), transcriber=LocalRecognition(),
-                                         expressive_replies=True, acknowledge_turns=True)
-        conversation._acknowledgement_audio = {phrase: (np.full(80, .1, dtype=np.float32),)
-                                               for phrase in reachy_voice.ACKNOWLEDGEMENTS}
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=LocalSpeech(),
+                                                                 transcriber=LocalRecognition()))
+        conversation.backends.voice.phrases = {phrase: (np.full(80, .1, dtype=np.float32),)
+                                               for phrase in reachy_local_backends.ACKNOWLEDGEMENTS}
         subscriber = asyncio.create_task(conversation._subscribe())
         await session.chat_subscribed.wait()
         await conversation.turn(b"voice")
@@ -1662,9 +1720,10 @@ def test_cancelling_request_stops_contextual_acknowledgement_before_listening_re
 
         session = FakeSession(send_hook=waiting_request)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=object(),
-                                         transcriber=LocalRecognition(), acknowledge_turns=True)
-        conversation._acknowledgement_audio = {"Let me check the weather.":
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=LocalRecognition()))
+        conversation.backends.voice.phrases = {"Let me check the weather.":
                                                (np.full(8000, .1, dtype=np.float32),) * 3}
         turn = asyncio.create_task(conversation.turn(b"voice"))
         while not hardware.played:
@@ -1701,9 +1760,10 @@ def test_completed_acknowledgement_hardware_failure_propagates_and_restores_capt
 
         hardware = BrokenSpeaker()
         session = FakeSession(send_hook=request)
-        conversation = VoiceConversation(session, hardware, speech=object(),
-                                         transcriber=LocalRecognition(), acknowledge_turns=True)
-        conversation._acknowledgement_audio = {"Let me check the weather.": (np.full(80, .1, dtype=np.float32),)}
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=LocalRecognition()))
+        conversation.backends.voice.phrases = {"Let me check the weather.": (np.full(80, .1, dtype=np.float32),)}
         speak = conversation._speak
         async def observed_speech(*args, **kwargs):
             try:
@@ -1748,9 +1808,10 @@ def test_turn_cancellation_preserves_cancellation_after_acknowledgement_hardware
 
         hardware = BrokenSpeaker()
         session = FakeSession(send_hook=request)
-        conversation = VoiceConversation(session, hardware, speech=object(),
-                                         transcriber=LocalRecognition(), acknowledge_turns=True)
-        conversation._acknowledgement_audio = {"Let me check the weather.": (np.full(80, .1, dtype=np.float32),)}
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=LocalRecognition()))
+        conversation.backends.voice.phrases = {"Let me check the weather.": (np.full(80, .1, dtype=np.float32),)}
         speak = conversation._speak
         async def observed_speech(*args, **kwargs):
             try:
@@ -1779,7 +1840,7 @@ def test_turn_cancellation_preserves_cancellation_after_acknowledgement_hardware
     ("Say pineapple sunshine.", None), ("I am sad.", None),
 ])
 def test_question_acknowledgement_matches_intent_without_a_generic_fallback(text, expected):
-    assert reachy_voice.contextual_acknowledgement(text) == expected
+    assert reachy_local_backends.contextual_acknowledgement(text) == expected
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -1806,11 +1867,14 @@ def test_wake_and_contextual_cues_are_cached_without_overlapping_synthesis(monke
     class Wake:
         phrase = "hey muse"
     async def scenario():
-        conversation = VoiceConversation(FakeSession(), FakeHardware(), speech=Speech(), transcriber=object(),
-                                         wake_detector=Wake(), acknowledge_turns=True)
+        session = FakeSession()
+        conversation = VoiceConversation(session, FakeHardware(),
+                                         backends=robot_backends(session, speech=Speech(),
+                                                                 transcriber=object()),
+                                         wake_detector=Wake())
         await conversation.prepare_acknowledgement()
-        assert synthesized == [*reachy_voice.ACKNOWLEDGEMENTS, "Yes?"]
-        assert set(conversation._acknowledgement_audio) == set(synthesized)
+        assert synthesized == [*reachy_local_backends.ACKNOWLEDGEMENTS, "Yes?"]
+        assert set(conversation.backends.voice.phrases) == set(synthesized)
         assert not conversation.hardware.played
     asyncio.run(bounded(scenario()))
 
@@ -1836,9 +1900,12 @@ def test_wake_only_or_unconfirmed_boundary_is_local_then_clean_followup_gets_con
             await session.delivered.get()
         session = FakeSession(send_hook=reply)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=Speech(), transcriber=Recognition(),
-                                         wake_detector=Wake(), stream_replies=True, expressive_replies=True)
-        conversation._acknowledgement_audio["Yes?"] = (np.full(80, .1, dtype=np.float32),)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=Speech(),
+                                                                 transcriber=Recognition(),
+                                                                 stream_replies=True),
+                                         wake_detector=Wake())
+        conversation.backends.voice.phrases["Yes?"] = (np.full(80, .1, dtype=np.float32),)
         conversation._wake_strip_required = True
         await conversation.turn(None)
         assert session.setup_messages == [] and not hardware.states
@@ -1880,7 +1947,10 @@ def test_same_breath_wake_question_strips_pre_wake_words_and_sends_one_request(m
             await session.delivered.get()
         session = FakeSession(send_hook=reply)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=Speech(), transcriber=Recognition(hardware), wake_detector=Wake())
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=Speech(),
+                                                                 transcriber=Recognition(hardware)),
+                                         wake_detector=Wake())
         conversation._wake_strip_required = True
         subscriber = asyncio.create_task(conversation._subscribe())
         await session.chat_subscribed.wait()
@@ -1933,8 +2003,10 @@ def test_wake_microphone_gates_asr_preserves_preroll_and_closes_only_after_turn_
         session = FakeSession()
         session.chat_subscribed.set()
         wake = Wake()
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=object(),
-                                         wake_detector=wake, wake_timeout_s=.06, expressive_replies=True)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=object()),
+                                         wake_detector=wake, wake_timeout_s=.06)
         turns = []
         release = asyncio.Event()
         async def turn(wav, **options):
@@ -2031,7 +2103,10 @@ def test_delayed_wake_endpoint_and_pending_same_chunk_keep_the_question(monkeypa
         session = FakeSession()
         session.chat_subscribed.set()
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=object(), wake_detector=Wake())
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=object()),
+                                         wake_detector=Wake())
         turns = []
         async def turn(wav, **options):
             turns.append(wav)
@@ -2088,7 +2163,10 @@ def test_sleeping_detector_receives_stateful_16k_resampling_and_preroll_is_bound
         hardware = FakeHardware()
         hardware.sample_rate = 48000
         wake = Wake()
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=object(), wake_detector=wake)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=object()),
+                                         wake_detector=wake)
         microphone = asyncio.create_task(conversation._microphone())
         try:
             while not hardware.states:
@@ -2151,7 +2229,10 @@ def test_continuous_capture_preserves_realtime_frames_during_slow_keyword_bursts
         hardware = FakeHardware()
         hardware.samples = queue.Queue(maxsize=2)
         wake = Wake()
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=object(), wake_detector=wake)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=object()),
+                                         wake_detector=wake)
         turns = []
         async def turn(wav, **options):
             turns.append(wav)
@@ -2270,7 +2351,10 @@ def test_capture_overflow_resets_keyword_and_recording_before_retained_audio(mon
         session.chat_subscribed.set()
         hardware = Hardware()
         wake = Wake(loop)
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=object(), wake_detector=wake)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=object()),
+                                         wake_detector=wake)
         microphone = asyncio.create_task(conversation._microphone())
         try:
             await ready.wait()
@@ -2303,7 +2387,7 @@ def test_capture_hardware_failure_propagates_and_cancels_its_producer():
         session = FakeSession()
         session.chat_subscribed.set()
         hardware = Hardware()
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         microphone = asyncio.create_task(conversation._microphone())
         while not hardware.states:
             await asyncio.sleep(.001)
@@ -2353,7 +2437,8 @@ def test_slow_recording_feed_keeps_microphone_producer_draining_and_joins_on_can
         monkeypatch.setattr(reachy_voice._CaptureBuffer, "push", push)
         session, hardware = FakeSession(), Hardware()
         session.chat_subscribed.set()
-        microphone = asyncio.create_task(VoiceConversation(session, hardware)._microphone())
+        microphone = asyncio.create_task(VoiceConversation(session, hardware,
+                                                           backends=robot_backends(session))._microphone())
         try:
             await ready.wait()
             hardware.samples.put(np.full(320, 1, np.float32))
@@ -2393,7 +2478,7 @@ def test_capture_cancellation_waits_for_the_outstanding_sdk_read():
         session = FakeSession()
         session.chat_subscribed.set()
         hardware = Hardware()
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         microphone = asyncio.create_task(conversation._microphone())
         try:
             while not entered.is_set():
@@ -2427,7 +2512,8 @@ def test_read_started_during_playback_stays_discarded_after_unmute():
             return None
     async def scenario():
         hardware = Hardware()
-        conversation = VoiceConversation(FakeSession(), hardware)
+        session = FakeSession()
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         conversation._muted = True
         buffer = reachy_voice._CaptureBuffer(16000)
         producer = asyncio.create_task(conversation._capture_microphone(buffer))
@@ -2466,7 +2552,7 @@ def test_non_wake_capture_gap_clears_the_listening_pose(monkeypatch):
         session = FakeSession()
         session.chat_subscribed.set()
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         microphone = asyncio.create_task(conversation._microphone())
         try:
             while not hardware.states:
@@ -2494,8 +2580,11 @@ def test_blank_first_wake_gives_local_cue_but_blank_followup_is_empty(monkeypatc
     async def scenario():
         hardware = FakeHardware()
         session = FakeSession()
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=Recognition(), wake_detector=Wake())
-        conversation._acknowledgement_audio["Yes?"] = (np.full(80, .1, dtype=np.float32),)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=Recognition()),
+                                         wake_detector=Wake())
+        conversation.backends.voice.phrases["Yes?"] = (np.full(80, .1, dtype=np.float32),)
         conversation._wake_strip_required = True
         assert await conversation.turn(b"first wake") is TurnOutcome.WAKE_CUE
         assert len(hardware.played) == 1 and hardware.states[-1] == "listening"
@@ -2538,9 +2627,11 @@ def test_missing_asr_wake_boundary_opens_time_for_question_after_slow_recognitio
         session = FakeSession()
         session.chat_subscribed.set()
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=Recognition(),
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=Recognition()),
                                          wake_detector=Wake(), wake_timeout_s=.03)
-        conversation._acknowledgement_audio["Yes?"] = (np.full(80, .1, dtype=np.float32),)
+        conversation.backends.voice.phrases["Yes?"] = (np.full(80, .1, dtype=np.float32),)
         microphone = asyncio.create_task(conversation._microphone())
         try:
             while not hardware.states:
@@ -2599,9 +2690,11 @@ def test_repeated_empty_vad_turns_cannot_keep_a_wake_session_open(monkeypatch):
         session.chat_subscribed.set()
         hardware = FakeHardware()
         recognition = Recognition()
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=recognition,
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=recognition),
                                          wake_detector=Wake(), wake_timeout_s=.08)
-        conversation._acknowledgement_audio["Yes?"] = (np.full(80, .1, dtype=np.float32),)
+        conversation.backends.voice.phrases["Yes?"] = (np.full(80, .1, dtype=np.float32),)
         microphone = asyncio.create_task(conversation._microphone())
         supplier = None
         async def background():
@@ -2637,7 +2730,9 @@ def test_marker_only_response_moves_silently_or_fails_without_motion(marker, exp
 
     async def scenario():
         hardware = FakeHardware()
-        conversation = VoiceConversation(FakeSession(), hardware, speech=UnusedSpeech(), expressive_replies=True)
+        session = FakeSession()
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=UnusedSpeech()))
         conversation.tracker = ReplyTracker()
         conversation.tracker.messages["reply-1"] = {"text": f"[reachy:{marker}]"}
         if expected:
@@ -2735,7 +2830,7 @@ class FakeSession:
             await self.send_hook(self)
         return self.acknowledgement
 
-    async def send_chat(self, message, session_id):
+    async def send_chat(self, message, session_id, **options):
         self.setup_messages.append((message, session_id))
         if self.send_hook is not None:
             await self.send_hook(self)
@@ -2814,7 +2909,9 @@ def test_ack_race_and_multiple_messages_play_real_mp3_once_each(mp3_tone, monkey
     async def scenario():
         session = FakeSession(mp3_tone, send_hook=before_ack)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, session_id="robot-chat", reply_timeout_s=2)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session),
+                                         session_id="robot-chat", reply_timeout_s=2)
         subscriber = asyncio.create_task(conversation._subscribe())
         await session.chat_subscribed.wait()
         await conversation.turn(b"voice recording")
@@ -2843,7 +2940,8 @@ def test_replayed_subscription_events_do_not_queue_old_replies():
     async def scenario():
         session = FakeSession()
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware, session_id="robot-chat")
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session), session_id="robot-chat")
         subscriber = asyncio.create_task(conversation._subscribe())
         await session.chat_subscribed.wait()
         await session.events.put(chat_event("delta.message_done", "old", seq=10, content="old"))
@@ -2880,7 +2978,7 @@ def test_rejected_or_invalid_voice_ack_restores_capture_and_clears_playback(
     async def scenario():
         session = FakeSession(acknowledgement=acknowledgement)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         with pytest.raises(error_type):
             await conversation.turn(b"recording")
         assert session.tts_requests == []
@@ -2896,7 +2994,9 @@ def test_voice_reply_timeout_restores_capture(monkeypatch):
 
     async def scenario():
         hardware = FakeHardware()
-        conversation = VoiceConversation(FakeSession(), hardware, reply_timeout_s=0.01)
+        session = FakeSession()
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session), reply_timeout_s=0.01)
         with pytest.raises(TimeoutError, match="did not complete"):
             await conversation.turn(b"recording")
         assert hardware.cleared == 1
@@ -2942,9 +3042,11 @@ def test_timely_final_reply_finishes_all_sentences_after_response_deadline(
 
         session = FakeSession(send_hook=deliver)
         speech = Speech(hardware)
-        conversation = VoiceConversation(session, hardware, session_id="robot-chat", speech=speech,
-                                         transcriber=Transcriber(), stream_replies=True,
-                                         expressive_replies=True, reply_timeout_s=.15)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech,
+                                                                 transcriber=Transcriber(),
+                                                                 stream_replies=True),
+                                         session_id="robot-chat", reply_timeout_s=.15)
         subscriber = asyncio.create_task(conversation._subscribe())
         try:
             await session.chat_subscribed.wait()
@@ -2987,8 +3089,10 @@ def test_stalled_answer_speech_has_its_own_bound_and_closes_playback(monkeypatch
 
         hardware = FakeHardware()
         session = FakeSession(send_hook=deliver)
-        conversation = VoiceConversation(session, hardware, session_id="robot-chat", speech=StalledSpeech(),
-                                         stream_replies=True, reply_timeout_s=2)
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=StalledSpeech(),
+                                                                 stream_replies=True),
+                                         session_id="robot-chat", reply_timeout_s=2)
         subscriber = asyncio.create_task(conversation._subscribe())
         try:
             await session.chat_subscribed.wait()
@@ -3010,7 +3114,7 @@ def test_subscription_error_ends_conversation_and_flushes_playback(monkeypatch):
         session = FakeSession()
         hardware = FakeHardware()
         await session.events.put(ConnectionError("subscription refused"))
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         with pytest.raises(ConnectionError, match="subscription refused"):
             await conversation.run()
         assert session.subscription_closed
@@ -3024,7 +3128,7 @@ def test_cancelling_speech_closes_tts_before_returning(mp3_tone):
     async def scenario():
         session = FakeSession(mp3_tone)
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         speaking = asyncio.create_task(conversation._speak("reply-1"))
         while not hardware.played:
             await asyncio.sleep(0.001)
@@ -3057,7 +3161,7 @@ def test_microphone_continues_draining_echo_while_reply_is_active(monkeypatch):
         session = FakeSession()
         session.chat_subscribed.set()
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         started = asyncio.Event()
         release = asyncio.Event()
         recorded = []
@@ -3108,7 +3212,7 @@ def test_real_noise_voice_note_gets_text_completion_and_paced_tts_burst(mp3_tone
     async def scenario():
         session, vm, stop, task = await registered_session()
         hardware = FakeHardware()
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         subscriber = asyncio.create_task(conversation._subscribe())
         subscription = await vm.next_frame()
         assert subscription.value.path == "/chat/subscribe"
@@ -3125,7 +3229,7 @@ def test_real_noise_voice_note_gets_text_completion_and_paced_tts_burst(mp3_tone
         voice_note = await vm.next_frame()
         assert voice_note.value.path == "/chat/stream"
         uploaded = json.loads(voice_note.value.body)
-        assert "output_modality" not in uploaded
+        assert uploaded["output_modality"] == "voice"
         assert uploaded["items"][0]["mime_type"] == "audio/wav"
         await vm.send_frame(ServiceFrame.response(voice_note.stream_id, ApplicationResponse(
             status=200, body=b'{"result":{"message_id":"user-1"}}', end_body=True,
@@ -3168,7 +3272,7 @@ def test_initial_motion_failure_restores_capture_and_releases_tracker(monkeypatc
     async def scenario():
         session = FakeSession()
         hardware = FailedHardware()
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         with pytest.raises(RuntimeError, match="hardware disconnected"):
             await conversation.turn(b"recording")
         assert session.sent == []
@@ -3188,7 +3292,7 @@ def test_playback_flush_failure_still_restores_capture(monkeypatch):
 
     async def scenario():
         session = FakeSession(acknowledgement={"ok": False, "status": 403})
-        conversation = VoiceConversation(session, FailedHardware())
+        conversation = VoiceConversation(session, FailedHardware(), backends=robot_backends(session))
         with pytest.raises(RuntimeError, match="flush unavailable"):
             await conversation.turn(b"recording")
         assert conversation.tracker is None
@@ -3209,7 +3313,7 @@ def test_cancelling_an_unacknowledged_turn_flushes_audio_and_restores_capture(mo
 
         hardware = FakeHardware()
         session = FakeSession(send_hook=wait_for_ack)
-        conversation = VoiceConversation(session, hardware)
+        conversation = VoiceConversation(session, hardware, backends=robot_backends(session))
         turning = asyncio.create_task(conversation.turn(b"recording"))
         await sending.wait()
         assert not conversation._input_blocked()

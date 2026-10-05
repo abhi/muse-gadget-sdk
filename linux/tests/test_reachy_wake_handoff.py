@@ -8,6 +8,7 @@ import wave
 import pytest
 
 from musegadget import reachy_voice, voice_audio
+from musegadget.reachy_local_backends import robot_backends
 from musegadget.reachy_voice import VoiceConversation
 from test_reachy_voice import FakeHardware, FakeSession, bounded, cancel_task
 
@@ -113,9 +114,11 @@ def handoff(monkeypatch):
         hardware = FakeHardware()
         wake = Wake(trusted=trusted, invalid=invalid, delayed=delayed)
         recognition = Recognition()
-        conversation = VoiceConversation(session, hardware, speech=object(), transcriber=recognition,
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=object(),
+                                                                 transcriber=recognition),
                                          wake_detector=wake, silence_s=.14)
-        conversation._acknowledgement_audio["Yes?"] = (np.full(80, .1, np.float32),)
+        conversation.backends.voice.phrases["Yes?"] = (np.full(80, .1, np.float32),)
 
         async def capture(buffer):
             original_get = buffer.get

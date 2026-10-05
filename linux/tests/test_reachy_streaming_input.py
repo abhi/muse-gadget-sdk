@@ -50,10 +50,6 @@ def test_audio_is_transcribed_during_speech_and_endpoint_sends_only_final_text(d
     recognizer = StreamingRecognizer()
 
     async def run(ctx):
-        ctx.conversation.owns_chat = True
-        ctx.conversation.session_id = "robot-chat"
-        ctx.session.acknowledgement["response"]["result"].update(
-            session_id="robot-chat", is_thread=True)
         await ctx.feed((.2, 25))
         stream, = recognizer.turns
         assert len(stream.audio) == 25 * 320 * 2
@@ -77,7 +73,7 @@ def test_audio_is_transcribed_during_speech_and_endpoint_sends_only_final_text(d
         assert second.audio and not second.ended
         assert len(ctx.session.setup_messages) == 1
 
-    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer, silence_s=2)))
+    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer, silence_s=2, owned=True)))
     assert recognizer.turns[1].aborted
 
 
@@ -159,10 +155,10 @@ def test_recognition_overflow_drops_the_whole_turn_and_keeps_listening(duplex):
         second.result.set_result("A complete replacement request.")
         while not ctx.session.setup_messages:
             await asyncio.sleep(0)
-        assert ctx.session.setup_messages == [("A complete replacement request.", None)]
+        assert ctx.session.setup_messages == [("A complete replacement request.", "robot-chat")]
         assert not ctx.microphone.done()
 
-    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer, speech=speech)))
+    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer, speech=speech, owned=True)))
 
 
 def test_failed_finalization_does_not_cancel_a_later_complete_utterance(duplex):
@@ -176,7 +172,7 @@ def test_failed_finalization_does_not_cancel_a_later_complete_utterance(duplex):
         second.result.set_result("Keep this second request.")
         while not ctx.session.setup_messages:
             await asyncio.sleep(0)
-        assert ctx.session.setup_messages == [("Keep this second request.", None)]
+        assert ctx.session.setup_messages == [("Keep this second request.", "robot-chat")]
         assert not ctx.microphone.done()
 
-    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer, speech=OrderedSpeech())))
+    asyncio.run(bounded(duplex(run, real_turn=True, transcriber=recognizer, speech=OrderedSpeech(), owned=True)))

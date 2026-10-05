@@ -11,6 +11,7 @@ import pytest
 
 from musegadget import config
 from musegadget import reachy_cli
+from musegadget.reachy_capabilities import ReplyStyle
 
 
 SETUP_NONCE = "a" * 32
@@ -682,10 +683,10 @@ def test_streaming_option_reaches_the_conversation_service(tmp_path, monkeypatch
     monkeypatch.setattr('musegadget.reachy_voice.ReachyService', Service)
     assert reachy_cli.main(['--state-dir', str(tmp_path), 'run', '--tts-model',
                            str(tmp_path / 'voice.onnx'), '--stream-replies']) == 0
-    assert captured['stream_replies'] is True
-    assert captured['speech'] is speech
-    assert captured['progress_speech'] is progress_speech
-    assert captured['speech'] is not captured['progress_speech']
+    backends = captured['backends'](object())
+    assert backends.reply_style is ReplyStyle.EXPRESSIVE_JSON
+    assert backends.voice.speech is speech
+    assert backends.progress_voice.speech is progress_speech
     assert calls == ['hardware started', 'speech started', 'progress speech started', 'service ran',
                      'hardware closed', 'speech closed', 'progress speech closed']
 
@@ -800,7 +801,7 @@ def test_wake_model_phrase_and_idle_timeout_reach_the_service(tmp_path, monkeypa
                            '--wake-phrase', 'hey muse', '--wake-timeout', '10',
                            '--stt-backend', stt_backend, *backend_args]) == 0
     assert captured['wake_detector'] is detector
-    assert captured['transcriber'] is transcriber
+    assert captured['backends'](object()).hearing.transcriber is transcriber
     assert captured['speech_gate'] is speech_gate
     assert captured['stt_model'] == tmp_path / 'whisper'
     assert (captured['model'], captured['phrase'], captured['wake_timeout_s']) == (model, 'hey muse', 10.0)
@@ -883,8 +884,9 @@ def test_startup_and_cleanup_failures_attempt_all_resource_cleanup(
 
     class Service:
         def __init__(self, **kwargs):
-            assert kwargs['speech'] is speech
-            assert kwargs['progress_speech'] is progress_speech
+            backends = kwargs['backends'](object())
+            assert backends.voice.speech is speech
+            assert backends.progress_voice.speech is progress_speech
             if operation == 'setup':
                 raise RuntimeError('service setup failed')
 

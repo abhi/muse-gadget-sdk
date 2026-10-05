@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import json
 import re
 
+from musegadget.reachy_capabilities import Expression
+
 REACHY_CAPABILITIES = (
     "You are Muse speaking through Reachy Mini, a tabletop robot with a microphone, "
     "speaker, a head with six degrees of freedom, a rotating body, and two independently "
@@ -32,8 +34,7 @@ VOICE_CONTEXT = _CONVERSATION_CONTEXT + (
 )
 
 _MARKER = re.compile(r"\[reachy:([a-zA-Z0-9_-]{1,80})\]")
-_EXPRESSIONS = frozenset(("neutral", "happy", "sad", "surprised", "curious", "nod",
-                          "shake", "listening", "thinking"))
+_EXPRESSIONS = frozenset(expression.value for expression in Expression)
 STREAM_VOICE_CONTEXT = _CONVERSATION_CONTEXT + (
     "Output only one JSON object per line with text and expression fields, plus optional kind. "
     "Each text is one complete conversational sentence; stream each sentence as it is ready. "

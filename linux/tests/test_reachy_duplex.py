@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from musegadget import reachy_voice
+from musegadget.reachy_local_backends import robot_backends
 from musegadget.reachy_voice import VoiceConversation, _SpeechJob
 from test_reachy_duplex_voice import duplex
 from test_reachy_voice import FakeHardware, FakeSession, bounded, cancel_task, chat_event, sentence_frame
@@ -64,7 +65,9 @@ def test_paused_old_answer_does_not_block_next_request_and_jobs_keep_turn_scope(
 
         session = FakeSession(send_hook=send)
         conversation = VoiceConversation(
-            session, hardware, session_id="robot-chat", speech=speech, stream_replies=True,
+            session, hardware,
+                                         backends=robot_backends(session, speech=speech, stream_replies=True),
+                                         session_id="robot-chat",
         )
         subscriber = asyncio.create_task(conversation._subscribe())
         speaker = asyncio.create_task(conversation._play_output())
@@ -101,7 +104,9 @@ def test_cancelling_global_speaker_closes_current_stream_and_drops_queued_tail()
     async def scenario():
         hardware = FakeHardware()
         speech = OrderedSpeech()
-        conversation = VoiceConversation(FakeSession(), hardware, speech=speech)
+        session = FakeSession()
+        conversation = VoiceConversation(session, hardware,
+                                         backends=robot_backends(session, speech=speech))
         conversation._playback.set_user_speaking(True)
         conversation._output_queue.put_nowait(_SpeechJob(None, "First."))
         conversation._output_queue.put_nowait(_SpeechJob(None, "Second."))
@@ -148,7 +153,8 @@ def test_final_revision_while_output_is_held_drops_every_draft_job(monkeypatch):
 
         session = FakeSession(send_hook=send)
         conversation = VoiceConversation(
-            session, hardware, speech=speech, stream_replies=True,
+            session, hardware,
+                                         backends=robot_backends(session, speech=speech, stream_replies=True),
         )
         subscriber = asyncio.create_task(conversation._subscribe())
         speaker = asyncio.create_task(conversation._play_output())
@@ -268,7 +274,7 @@ def test_capture_gap_during_user_speech_requires_a_fresh_quiet_interval(duplex):
         assert len(ctx.hardware.played) > played
 
     asyncio.run(bounded(duplex(
-        run, echo=True, speech=Speech(), silence_s=.1,
+        run, echo=True, speech=Speech(), silence_s=.1, owned=True,
     )))
 
 
@@ -280,7 +286,7 @@ def test_next_asr_runs_before_the_previous_backend_turn_finishes(duplex):
             number = len(session.setup_messages)
             session.acknowledgement = {
                 "ok": True, "status": 200,
-                "response": {"message_id": f"user-{number}"},
+                "response": {"message_id": f"user-{number}", "session_id": "robot-chat", "is_thread": True},
             }
             acknowledged[number - 1].set()
 
@@ -310,5 +316,5 @@ def test_next_asr_runs_before_the_previous_backend_turn_finishes(duplex):
             await cancel_task(subscriber)
 
     asyncio.run(bounded(duplex(
-        run, echo=True, real_turn=True, hold_recognition=True, speech=OrderedSpeech(),
+        run, echo=True, real_turn=True, hold_recognition=True, speech=OrderedSpeech(), owned=True,
     )))
