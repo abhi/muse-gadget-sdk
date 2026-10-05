@@ -96,6 +96,13 @@ Ask Muse things like:
 
 > Every morning at 7, check if my Pi's backups ran and tell me if they didn't.
 
+## Talk through Reachy Mini
+
+Use Reachy Mini's microphone, speaker, head, and antennas as a Muse voice
+companion. The optional `muse-reachy` command adds local "Hey Muse" invocation,
+hands-free voice turns, streamed Muse speech, and expressive robot commands. See the
+[Reachy Mini guide](docs/reachy-mini.md) for setup, diagnostics, and startup.
+
 ## Hack and extend it
 
 Programs on the machine can send messages to Muse, with no credentials of

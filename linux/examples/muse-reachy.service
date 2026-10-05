@@ -1,0 +1,17 @@
+[Unit]
+Description=Muse voice conversations through Reachy Mini
+Wants=network-online.target
+After=network-online.target reachy-mini-daemon.service
+ConditionPathExists=/home/pollen/.local/share/musegadget-reachy/pairing.json
+
+[Service]
+Type=simple
+User=pollen
+WorkingDirectory=/home/pollen/muse-gadget-sdk/linux
+ExecStart=/home/pollen/muse-reachy-venv/bin/muse-reachy run --stream-replies --tts-model /home/pollen/.local/share/musegadget-reachy/voices/en_US-lessac-medium.onnx --stt-model /home/pollen/.local/share/musegadget-reachy/whisper-tiny.en
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

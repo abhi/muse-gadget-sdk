@@ -29,15 +29,20 @@ dependencies = ["cryptography>=3.3.2", "websockets>=13"]
 
 [project.scripts]
 musegadget = "musegadget.cli:main"
+muse-reachy = "musegadget.reachy_cli:main"
 
 [project.optional-dependencies]
 test = ["pytest"]
+reachy = ["reachy-mini>=1.9,<2", "numpy>=1.24", "av>=12", "webrtcvad-wheels>=2.0.14"]
+reachy-wake = ["sherpa-onnx==1.13.8", "sentencepiece==0.2.2"]
+reachy-wake-vosk = ["vosk==0.3.45"]
+reachy-stt-streaming = ["sherpa-onnx==1.13.8"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-musegadget = ["data/*"]
+musegadget = ["data/*", "data/face_tracking/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

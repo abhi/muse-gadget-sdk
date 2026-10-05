@@ -1,0 +1,9 @@
+[Unit]
+Description=Start Muse voice after Reachy is paired
+
+[Path]
+PathExists=/home/pollen/.local/share/musegadget-reachy/pairing.json
+Unit=muse-reachy.service
+
+[Install]
+WantedBy=multi-user.target
