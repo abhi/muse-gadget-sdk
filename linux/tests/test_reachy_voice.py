@@ -18,8 +18,8 @@ from musegadget.reachy_capabilities import Mode, ReplyStyle
 from musegadget.reachy_local_backends import backends_for
 from musegadget.reachy_progress import BackendActivity, BackendStatus
 from musegadget.reachy_voice import (
-    BackendStatusSegment, ProgressSegment, ReplayScope, ReplyTracker, SpeechSegment, TaskFinished, TurnOutcome,
-    VoiceConversation,
+    BackendStatusSegment, MuseJob, ProgressSegment, ReplayScope, ReplyTracker, SpeechSegment, TaskFinished,
+    TurnOutcome, VoiceConversation,
 )
 
 
@@ -33,6 +33,10 @@ def progress_frame(text="Looking at flights now."):
 
 def status_segment(activity=None, phase="working"):
     return BackendStatusSegment(BackendStatus(phase, activity))
+
+
+def muse_job(tracker, **fields):
+    return MuseJob("", tracker.style, tracker, 0.0, False, **fields)
 
 
 def owned_tracker(scope=None, user_id="user-1"):
@@ -206,7 +210,7 @@ def test_idle_subscription_snapshots_are_retired_before_the_next_ack():
                                                 activity_code="working", activity_text="Searching web"))
             await session.delivered.get()
             tracker = owned_tracker(conversation._replay_scope)
-            conversation.tracker = tracker
+            conversation.job = muse_job(tracker)
             await session.events.put(chat_event("task.status", parent=None, task_id="idle-task", status="running", seq=3))
             await session.delivered.get()
             await session.events.put(chat_event("agent.status", "idle-worker", parent=None, seq=4,
@@ -232,11 +236,11 @@ def test_cancelled_unacknowledged_owned_turn_retires_pending_ids(monkeypatch):
                                          session_id="robot-chat", owns_chat=True)
         turn = asyncio.create_task(conversation.turn(b"wav"))
         await started.wait()
-        tracker = conversation.tracker
+        tracker = conversation.job.tracker
         tracker.event(chat_event("task.status", parent=None, task_id="cancelled-task", status="running"))
         tracker.event(chat_event("delta.message_start", "cancelled-message", parent=None))
         await cancel_task(turn)
-        assert conversation.tracker is None
+        assert conversation.job is None
         assert {("task", "cancelled-task"), ("message", "cancelled-message")} <= conversation._replay_scope.ids
     asyncio.run(bounded(scenario()))
 
@@ -329,26 +333,26 @@ def test_owned_chat_backend_stages_are_spoken_once_and_answer_stops_them(monkeyp
                                      session_id="robot-chat", owns_chat=True)
     tracker = ReplyTracker("robot-chat", style=ReplyStyle.EXPRESSIVE_JSON, owns_chat=True)
     tracker.acknowledge({"message_id": "user-1", "session_id": "robot-chat", "is_thread": True})
-    conversation._progress = ProgressPlan("Look up the documentation.", 0)
+    job = muse_job(tracker, progress=ProgressPlan("Look up the documentation.", 0))
     clock = 8.153
     asyncio.run(conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
-                                                        activity_text="Searching web")), tracker))
-    assert conversation._progress.take(20).text == "Muse's last reported step was searching the web."
+                                                        activity_text="Searching web")), job))
+    assert job.progress.take(20).text == "Muse's last reported step was searching the web."
     clock = 22.183
     asyncio.run(conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
-                                                        activity_text="Searching sources")), tracker))
-    assert conversation._progress.take(40).text == "Muse's last reported step was searching sources."
-    assert conversation._progress.take(60) is None
+                                                        activity_text="Searching sources")), job))
+    assert job.progress.take(40).text == "Muse's last reported step was searching sources."
+    assert job.progress.take(60) is None
     clock = 61
     asyncio.run(conversation._queue_replies(tracker.event(chat_event("agent.status", parent=None,
-                                                        activity_text="is responding")), tracker))
-    assert conversation._progress.take(80) is None
-    assert conversation._replies.empty()
+                                                        activity_text="is responding")), job))
+    assert job.progress.take(80) is None
+    assert job.replies.empty()
     clock = 81
     asyncio.run(conversation._queue_replies(tracker.event(chat_event("delta.text_append", "answer", parent=None,
-                                                        text=sentence_frame("Here is the documentation."))), tracker))
-    assert conversation._progress.take(100) is None
-    assert conversation._replies.get_nowait() == SpeechSegment("answer", 0, "Here is the documentation.", "neutral")
+                                                        text=sentence_frame("Here is the documentation."))), job))
+    assert job.progress.take(100) is None
+    assert job.replies.get_nowait() == SpeechSegment("answer", 0, "Here is the documentation.", "neutral")
 
 
 def test_lunch_request_reports_working_phase_before_delayed_answer(monkeypatch):
@@ -360,21 +364,21 @@ def test_lunch_request_reports_working_phase_before_delayed_answer(monkeypatch):
                                      backends=backends_for(Mode.MUSE_VOICE, session),
                                      session_id="robot-chat", owns_chat=True)
     tracker = owned_tracker()
-    conversation._progress = ProgressPlan("What should I cook for lunch?", 0)
+    job = muse_job(tracker, progress=ProgressPlan("What should I cook for lunch?", 0))
     clock = 2
     asyncio.run(conversation._queue_replies(tracker.event(chat_event(
-        "agent.status", parent=None, activity_code="working", activity_text="is working")), tracker))
-    update = conversation._progress.take(20)
+        "agent.status", parent=None, activity_code="working", activity_text="is working")), job))
+    update = job.progress.take(20)
     assert update.source == "backend"
     assert update.text == "Muse's latest status is that it's working on your request."
     clock = 27
     asyncio.run(conversation._queue_replies(tracker.event(chat_event(
-        "agent.status", parent=None, activity_code="responding", activity_text="is responding")), tracker))
+        "agent.status", parent=None, activity_code="responding", activity_text="is responding")), job))
     asyncio.run(conversation._queue_replies(tracker.event(chat_event(
         "delta.text_append", "lunch-answer", parent=None,
-        text=sentence_frame("Try a quick vegetable omelette.", "happy"))), tracker))
-    assert conversation._progress.take(40) is None
-    assert conversation._replies.get_nowait() == SpeechSegment(
+        text=sentence_frame("Try a quick vegetable omelette.", "happy"))), job))
+    assert job.progress.take(40) is None
+    assert job.replies.get_nowait() == SpeechSegment(
         "lunch-answer", 0, "Try a quick vegetable omelette.", "happy")
 
 
@@ -387,14 +391,14 @@ def test_early_public_milestone_survives_the_first_twenty_second_cue(monkeypatch
                                      backends=backends_for(Mode.MUSE_VOICE, session),
                                      session_id="robot-chat", owns_chat=True)
     tracker = owned_tracker()
-    conversation._progress = ProgressPlan("Find a recipe.", 0)
+    job = muse_job(tracker, progress=ProgressPlan("Find a recipe.", 0))
     clock = 1
     asyncio.run(conversation._queue_replies(tracker.event(chat_event(
         "delta.text_append", "recipe-progress", parent=None,
-        text=progress_frame("I found three recipes that match your ingredients."))), tracker))
-    assert conversation._progress.take(20).text == (
+        text=progress_frame("I found three recipes that match your ingredients."))), job))
+    assert job.progress.take(20).text == (
         "Earlier from Muse: I found three recipes that match your ingredients.")
-    assert conversation._replies.empty()
+    assert job.replies.empty()
     assert not tracker.complete(20, False)
 
 
@@ -450,7 +454,7 @@ def test_progress_playback_is_preempted_and_closed_before_answer_or_turn_cleanup
             while not hardware.played:
                 await asyncio.sleep(.001)
             assert ("thinking", None) in hardware.state_expressions
-            assert conversation.tracker.messages == {}
+            assert conversation.job.tracker.messages == {}
             if ending == "cancel":
                 await cancel_task(turn)
             elif ending == "timeout":
@@ -469,7 +473,7 @@ def test_progress_playback_is_preempted_and_closed_before_answer_or_turn_cleanup
                 assert speech.requests == (["Found it."] if ending == "answer" else
                                            ["Muse returned an empty reply. Please try again."])
             assert closed.is_set() and not conversation._muted
-            assert conversation.tracker is None and conversation._progress is None
+            assert conversation.job is None
             assert hardware.cleared == (1 if ending in ('cancel', 'timeout') else 2)
             assert not hardware.commands
         finally:
@@ -586,7 +590,7 @@ def test_completed_progress_hardware_error_survives_answer_race(monkeypatch, str
             with pytest.raises(ReachyHardwareError, match="speaker failed"):
                 await turn
             assert speech.requests == []
-            assert conversation.tracker is None and conversation._progress is None
+            assert conversation.job is None
             assert not conversation._muted
         finally:
             await cancel_task(subscriber)
@@ -923,7 +927,7 @@ async def streaming_turn(script, speech, hardware, *, before_ack=False):
         await session.chat_subscribed.wait()
         await conversation.turn(b"voice")
         await asyncio.gather(*producers)
-        assert not conversation._muted and conversation.tracker is None
+        assert not conversation._muted and conversation.job is None
         assert hardware.cleared == 1
     finally:
         for producer in producers:
@@ -988,7 +992,7 @@ def test_streaming_first_frame_plays_before_done_and_expressions_match_playback(
         async def heard_before_done(conversation):
             while not hardware.played:
                 await asyncio.sleep(.001)
-            assert not conversation.tracker.messages["reply-1"]["done"]
+            assert not conversation.job.tracker.messages["reply-1"]["done"]
             assert speech.requests == ["Wow!"]
 
         await streaming_turn([
@@ -1118,7 +1122,7 @@ def test_cancelling_streaming_closes_active_speech_before_capture_resumes(stream
         await started.wait()
         await cancel_task(turn)
         assert closed.is_set() and hardware.cleared == 1
-        assert not conversation._muted and conversation.tracker is None
+        assert not conversation._muted and conversation.job is None
         await cancel_task(subscriber)
     asyncio.run(bounded(scenario()))
 
@@ -1584,7 +1588,7 @@ def test_local_recognition_sends_words_to_muse_and_ignores_empty_speech(monkeypa
         assert hardware.commands == []
         assert hardware.play_expressions == ([("speaking", "nod")] if recognized else [])
         assert not conversation._muted
-        assert conversation.tracker is None
+        assert conversation.job is None
         await cancel_task(subscriber)
 
     asyncio.run(bounded(scenario()))
@@ -1620,7 +1624,7 @@ def test_empty_muse_reply_announces_the_problem_and_resumes_without_reconnecting
         await conversation.turn(b"voice")
         assert spoken == ["Muse returned an empty reply. Please try again."]
         assert not conversation._muted
-        assert conversation.tracker is None
+        assert conversation.job is None
         assert not session.subscription_closed
         assert hardware.cleared == 1
         await cancel_task(subscriber)
@@ -1726,7 +1730,7 @@ def test_cancelling_request_stops_contextual_acknowledgement_before_listening_re
         await cancel_task(turn)
         assert 0 < sum(len(chunk) for chunk in hardware.played) <= hardware.output_sample_rate * .08
         assert hardware.cleared == 1
-        assert conversation.tracker is None
+        assert conversation.job is None
         assert not conversation._muted
 
     asyncio.run(bounded(scenario()))
@@ -1769,7 +1773,7 @@ def test_completed_acknowledgement_hardware_failure_propagates_and_restores_capt
         with pytest.raises(ReachyHardwareError, match="speaker disconnected"):
             await conversation.turn(b"voice")
         assert hardware.cleared == 1
-        assert conversation.tracker is None
+        assert conversation.job is None
         assert not conversation._muted
 
     asyncio.run(bounded(scenario()))
@@ -1818,7 +1822,7 @@ def test_turn_cancellation_preserves_cancellation_after_acknowledgement_hardware
         await request_waiting.wait()
         await cancel_task(turn)
         assert hardware.cleared == 1
-        assert conversation.tracker is None
+        assert conversation.job is None
         assert not conversation._muted
 
     asyncio.run(bounded(scenario()))
@@ -2953,7 +2957,7 @@ def test_ack_race_and_multiple_messages_play_real_mp3_once_each(mp3_tone, monkey
         assert abs(frequencies[np.argmax(spectrum)] - 220) < 15
         assert hardware.cleared == 1
         assert not conversation._muted
-        assert conversation.tracker is None
+        assert conversation.job is None
         await cancel_task(subscriber)
         assert session.subscription_closed
 
@@ -2971,8 +2975,8 @@ def test_replayed_subscription_events_do_not_queue_old_replies():
         await session.chat_subscribed.wait()
         await session.events.put(chat_event("delta.message_done", "old", seq=10, content="old"))
         await session.delivered.get()
-        conversation.tracker = ReplyTracker("robot-chat")
-        conversation.tracker.acknowledge({"message_id": "user-1"})
+        conversation.job = muse_job(ReplyTracker("robot-chat"))
+        conversation.job.tracker.acknowledge({"message_id": "user-1"})
         for event in [
             chat_event("delta.message_done", "old", seq=10, content="old"),
             chat_event("delta.message_done", "unrelated", seq=9, parent="other-user", content="old"),
@@ -2982,9 +2986,9 @@ def test_replayed_subscription_events_do_not_queue_old_replies():
         ]:
             await session.events.put(event)
             await session.delivered.get()
-        assert conversation._replies.get_nowait() == "reply-1"
-        assert conversation._replies.get_nowait() == "reply-2"
-        assert conversation._replies.empty()
+        assert conversation.job.replies.get_nowait() == "reply-1"
+        assert conversation.job.replies.get_nowait() == "reply-2"
+        assert conversation.job.replies.empty()
         await cancel_task(subscriber)
 
     asyncio.run(bounded(scenario()))
@@ -3009,7 +3013,7 @@ def test_rejected_or_invalid_voice_ack_restores_capture_and_clears_playback(
         assert session.tts_requests == []
         assert hardware.cleared == 1
         assert not conversation._muted
-        assert conversation.tracker is None
+        assert conversation.job is None
 
     asyncio.run(bounded(scenario()))
 
@@ -3081,7 +3085,7 @@ def test_timely_final_reply_finishes_all_sentences_after_response_deadline(
             assert hardware.play_expressions == [("speaking", expression) for _, expression in sentences]
             assert len(hardware.played) == 3 and np.concatenate(hardware.played).size == 240
             assert clock[0] > recognition_delay + .15
-            assert not conversation._muted and conversation.tracker is None
+            assert not conversation._muted and conversation.job is None
             assert "Reachy voice turn started" in caplog.text
             assert "Reachy voice turn ended" in caplog.text
         finally:
@@ -3125,7 +3129,7 @@ def test_stalled_answer_speech_has_its_own_bound_and_closes_playback(monkeypatch
                 await conversation.turn(b"public recording")
             assert entered.is_set() and closed.is_set()
             assert hardware.played == [] and hardware.cleared == 1
-            assert not conversation._muted and conversation.tracker is None
+            assert not conversation._muted and conversation.job is None
         finally:
             await cancel_task(subscriber)
 
@@ -3303,7 +3307,7 @@ def test_initial_motion_failure_restores_capture_and_releases_tracker(monkeypatc
             await conversation.turn(b"recording")
         assert session.sent == []
         assert hardware.cleared == 1
-        assert conversation.tracker is None
+        assert conversation.job is None
         assert not conversation._muted
 
     asyncio.run(bounded(scenario()))
@@ -3321,7 +3325,7 @@ def test_playback_flush_failure_still_restores_capture(monkeypatch):
         conversation = VoiceConversation(session, FailedHardware(), backends=backends_for(Mode.MUSE_VOICE, session))
         with pytest.raises(RuntimeError, match="flush unavailable"):
             await conversation.turn(b"recording")
-        assert conversation.tracker is None
+        assert conversation.job is None
         assert not conversation._muted
 
     asyncio.run(bounded(scenario()))
@@ -3346,7 +3350,7 @@ def test_cancelling_an_unacknowledged_turn_flushes_audio_and_restores_capture(mo
         await cancel_task(turning)
         assert hardware.cleared == 1
         assert session.tts_requests == []
-        assert conversation.tracker is None
+        assert conversation.job is None
         assert not conversation._muted
 
     asyncio.run(bounded(scenario()))

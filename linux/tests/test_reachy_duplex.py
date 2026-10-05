@@ -77,12 +77,12 @@ def test_paused_old_answer_does_not_block_next_request_and_jobs_keep_turn_scope(
             await conversation.turn(
                 b"first", recognized_text="First question.", defer_playback=True,
             )
-            assert conversation.tracker is None and conversation._has_output()
+            assert conversation.job is None and conversation._has_output()
             await conversation.turn(
                 b"second", recognized_text="Second question.", defer_playback=True,
             )
             assert len(session.setup_messages) == 2
-            assert conversation.tracker is None and conversation._has_output()
+            assert conversation.job is None and conversation._has_output()
             assert not hardware.played and not hardware.play_expressions
 
             conversation._playback.set_user_speaking(False)

@@ -25,7 +25,7 @@ class Session:
     async def send_chat(self, text, session_id, **options):
         self.sent.append((text, session_id, options))
         for status in ("running", "completed"):
-            self.conversation.tracker.event({
+            self.conversation.job.tracker.event({
                 "type": "event",
                 "event": "task.status",
                 "payload": {

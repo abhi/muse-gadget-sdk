@@ -500,6 +500,23 @@ class ReplyTracker:
                 and now - self.last_activity >= (EMPTY_REPLY_GRACE_S if self.messages else REPLY_QUIET_S))
 
 
+@dataclass(eq=False)
+class MuseJob:
+    """One request Muse works on, from dispatch until its answer is delivered or dropped."""
+
+    request: str | None            # the words Muse was sent; "" for audio only, None for Reachy's setup message
+    style: ReplyStyle              # the reply style it was sent with, which picks its parser
+    tracker: ReplyTracker
+    started: float                 # when the voice turn that asked it began
+    defer_playback: bool           # answers go through the speaker queue instead of being spoken inline
+    dispatched_at: float = field(default_factory=time.monotonic)
+    replies: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=32))
+    progress: ProgressPlan | None = None
+    acknowledgement: asyncio.Task | None = None
+    progress_speech: asyncio.Task | None = None
+    answered: bool = False
+
+
 class VoiceConversation:
     def __init__(self, session: LinkSession, hardware, *, backends: Backends,
                  session_id: str | None = None,
@@ -516,7 +533,6 @@ class VoiceConversation:
         self.silence_s = silence_s
         self.reply_timeout_s = reply_timeout_s
         self.backends = backends
-        self._progress: ProgressPlan | None = None
         self._prepared_speech = {}
         self._closing_speech = set()
         self.wake_detector = wake_detector
@@ -530,8 +546,7 @@ class VoiceConversation:
         # local style; a shared wake chat learns it from the first request.
         self._muse_style: ReplyStyle | None = (
             None if wake_detector is not None and not owns_chat else backends.local_style)
-        self.tracker: ReplyTracker | None = None
-        self._replies: asyncio.Queue[str | SpeechSegment | TaskFinished] = asyncio.Queue(maxsize=32)
+        self.job: MuseJob | None = None
         self._seen_sequences: set[int] = set()
         self._sequence_order = deque()
         self._muted = False
@@ -549,7 +564,6 @@ class VoiceConversation:
         self._output_queue: asyncio.Queue[_SpeechJob] = asyncio.Queue(maxsize=32)
         self._output_busy = False
         self._output_prefetched = False
-        self._defer_playback = False
         self._planner = plan.ExpressionPlanner()
         self._muse_status: BackendStatus | None = None
 
@@ -638,7 +652,7 @@ class VoiceConversation:
                     if self._wake_deadline is not None:
                         self._wake_deadline = time.monotonic() + (self.wake_timeout_s or 10.0)
                     await self._plan(plan.OutputIdle(user_speaking=self._playback.user_speaking,
-                                                     turn_open=self.tracker is not None,
+                                                     turn_open=self.job is not None,
                                                      wake_open=self._wake_deadline is not None))
         finally:
             if not following.done():
@@ -691,12 +705,13 @@ class VoiceConversation:
                     self._sequence_order.append(seq)
                     if len(self._sequence_order) > 2048:
                         self._seen_sequences.discard(self._sequence_order.popleft())
-                tracker = self.tracker
-                if tracker is not None:
+                job = self.job
+                if job is not None:
+                    tracker = job.tracker
                     had_message = bool(tracker.messages)
                     had_text = any(message["text"].strip() for message in tracker.messages.values())
                     completed_before = {message_id for message_id, message in tracker.messages.items() if message["done"]}
-                    await self._queue_replies(tracker.event(event), tracker)
+                    await self._queue_replies(tracker.event(event), job)
                     self._log_backend_activity()
                     if self._turn_started is not None:
                         elapsed = time.monotonic() - self._turn_started
@@ -713,7 +728,7 @@ class VoiceConversation:
             await subscription.aclose()
 
     def _log_backend_activity(self) -> None:
-        code = self.tracker.activity_code if self.tracker is not None else None
+        code = self.job.tracker.activity_code if self.job is not None else None
         if code is not None and code != self._logged_activity:
             self._logged_activity = code
             if self._activity_log_count < 32:
@@ -728,17 +743,17 @@ class VoiceConversation:
                 status.phase, status.activity.current_text if status.activity else None,
                 output=self._has_output()))
 
-    async def _queue_replies(self, replies, tracker: ReplyTracker) -> None:
+    async def _queue_replies(self, replies, job: MuseJob) -> None:
         pending = []
-        while not self._replies.empty():
-            pending.append(self._replies.get_nowait())
+        while not job.replies.empty():
+            pending.append(job.replies.get_nowait())
         status_arrived = False
         for reply in (*pending, *replies):
             if isinstance(reply, BackendStatusSegment):
                 self._muse_status = reply.status
                 status_arrived = True
-                if self._progress is not None:
-                    accepted = self._progress.set_status(reply.status, time.monotonic())
+                if job.progress is not None:
+                    accepted = job.progress.set_status(reply.status, time.monotonic())
                     if accepted and reply.status != self._logged_progress_status:
                         self._logged_progress_status = reply.status
                         if self._activity_log_count < 32:
@@ -750,22 +765,22 @@ class VoiceConversation:
                             self._activity_log_count += 1
                 continue
             if isinstance(reply, ProgressSegment):
-                if self._progress is not None:
-                    self._progress.offer(reply.text, time.monotonic(), source=reply.source)
+                if job.progress is not None:
+                    job.progress.offer(reply.text, time.monotonic(), source=reply.source)
                 continue
             if isinstance(reply, SpeechSegment):
-                message = tracker.messages[reply.message_id]
+                message = job.tracker.messages[reply.message_id]
                 if message["stream_revised"] or reply.index < message["stream_skip_before"]:
                     self._discard_prepared((reply.message_id, reply.index))
                     continue
-            if self._progress is not None:
-                self._progress.stop()
+            if job.progress is not None:
+                job.progress.stop()
             try:
-                self._replies.put_nowait(reply)
+                job.replies.put_nowait(reply)
             except asyncio.QueueFull:
                 raise ValueError("Muse returned too many queued speech segments") from None
             key = (reply.message_id, reply.index) if isinstance(reply, SpeechSegment) else None
-            if (not self._defer_playback and key is not None and key not in self._prepared_speech
+            if (not job.defer_playback and key is not None and key not in self._prepared_speech
                     and reply.text.strip() and len(self._prepared_speech) < 2):
                 prepared = self.backends.voice.prepare(
                     _line(reply.message_id, reply.text, reply.expression), self.hardware.output_sample_rate)
@@ -1191,249 +1206,40 @@ class VoiceConversation:
                    recognized_text: str | None = None, defer_playback: bool = False) -> TurnOutcome:
         if wav is None and self.wake_detector is not None:
             return TurnOutcome.EMPTY
-        self._defer_playback = defer_playback
         started = self._turn_started = time.monotonic()
         log.info("Reachy voice turn started")
-        acknowledgement_task = None
-        progress_task = None
         turn_cancelled = False
         completed = False
-        async def finish_progress(*, cancel: bool = False) -> None:
-            nonlocal progress_task
-            if progress_task is not None:
-                task, progress_task = progress_task, None
-                if cancel:
-                    task.cancel()
-                result, = await asyncio.gather(task, return_exceptions=True)
-                if isinstance(result, Exception):
-                    from musegadget.reachy_hardware import ReachyHardwareError
-                    if isinstance(result, ReachyHardwareError) and not turn_cancelled:
-                        raise result
-                    log.warning("Spoken progress failed: %s", type(result).__name__)
-        async def stop_progress() -> None:
-            if self._progress is not None:
-                self._progress.stop()
-            await finish_progress(cancel=True)
-        async def announce(text: str) -> None:
-            if defer_playback:
-                await self._output_queue.put(_SpeechJob(None, text, started=started, state="listening"))
-            else:
-                await self._speak(None, text=text, state="listening", stream_segment=True)
         try:
             await self._plan(plan.TurnStarted(output=self._has_output(),
                                               user_speaking=self._playback.user_speaking))
             text = None
-            if wav is not None and (self.backends.hearing.transcribes or recognized_text is not None):
-                text = (recognized_text if recognized_text is not None
-                        else await self.backends.hearing.transcribe(wav))
-                strip_required = (self._wake_strip_required if wake_strip_required is None
-                                  else wake_strip_required)
-                if wake_strip_required is None:
-                    self._wake_strip_required = False
-                if not text.strip():
-                    log.info("Speech recognition outcome empty")
-                    if self.wake_detector is not None and strip_required:
-                        await announce(WAKE_CUE)
-                        completed = True
-                        return TurnOutcome.WAKE_CUE
-                    log.info("No words recognized in microphone input; listening again")
+            if wav is not None:
+                text = await self._hear(wav, recognized_text, wake_strip_required,
+                                        started=started, defer_playback=defer_playback)
+                if isinstance(text, TurnOutcome):
                     completed = True
-                    return TurnOutcome.EMPTY
-                if self.wake_detector is not None:
-                    if strip_required:
-                        question = question_after_wake(text, self.wake_detector.phrase)
-                        # The wake detector confirms the acoustic trigger, but ASR must identify its boundary.
-                        log.info("Wake transcription outcome %s", "missing_boundary" if question is None
-                                 else "request" if question else "wake_only")
-                        text = question or ""
-                    else:
-                        text = strip_wake_prefix(text, self.wake_detector.phrase)
-                    if not text:
-                        await announce(WAKE_CUE)
-                        completed = True
-                        return TurnOutcome.WAKE_CUE
-                log.info("Recognized %d characters from Reachy's microphone", len(text))
-                await self._plan(plan.Working(output=self._has_output(),
-                                              user_speaking=self._playback.user_speaking))
-            style = self.backends.reply_style()
-            self.tracker = ReplyTracker(self.session_id, style=style,
-                                        owns_chat=self.owns_chat, replay_scope=self._replay_scope)
-            self._logged_activity = None
-            self._activity_log_count = 0
-            self._logged_progress_status = None
-            self._muse_status = None
-            self._replies = asyncio.Queue(maxsize=32)
-            request_text = text or ""
-            response_deadline = time.monotonic() + self.reply_timeout_s
-            options = {}
-            if style is ReplyStyle.MUSE_VOICE:
-                options["output_modality"] = "voice"
-            if text is not None and not self._has_output() and not self._playback.user_speaking:
-                acknowledgement_task = asyncio.create_task(self._acknowledge(text, started))
-            if wav is None:
-                ack = await self.session.send_chat(self._voice_context(style) + _SETUP_REQUEST[style],
-                                                   self.session_id)
-            elif text is not None:
-                ack = await self.session.send_chat(self._ensure_muse_style(style, text),
-                                                   self.session_id, **options)
-            else:
-                ack = await self.session.send_voice(wav, self.session_id, **options)
-            if not ack.get("ok"):
-                raise ConnectionError(f"Muse rejected conversation request: HTTP {ack.get('status')}")
-            response = ack.get("response")
-            if not isinstance(response, dict):
-                raise ValueError("Muse did not acknowledge the voice note")
-            if text is not None or wav is None:
-                self._muse_style = style
-            if wav is not None and self.backends.progress_voice is not None:
-                self._progress = self.backends.narrator.progress(request_text, time.monotonic())
-            await self._queue_replies(self.tracker.acknowledge(response), self.tracker)
-            self._log_backend_activity()
-            if wav is None:
-                log.info("Muse accepted Reachy's expression setup")
-            else:
-                log.info("Muse accepted a %.1f-second voice turn", max(0, len(wav) - 44) / 32000)
-            if acknowledgement_task is not None:
-                await acknowledgement_task
-            played = False
-            waiting_for_segment = False
-            progress_said = []
-            while True:
-                now = time.monotonic()
-                if self.tracker.task_finished:
-                    await stop_progress()
-                if self.tracker.complete(now, played) and self._replies.empty():
-                    completed = True
-                    return TurnOutcome.ACCEPTED
-                if not played and self._replies.empty() and self.tracker.finished_without_text(now):
-                    await stop_progress()
-                    log.warning("Muse finished without reply text; returning to listening")
-                    if self.backends.voice.speaks_text:
-                        from musegadget.reachy_hardware import ReachyHardwareError
-                        try:
-                            await announce("Muse returned an empty reply. Please try again.")
-                        except ReachyHardwareError:
-                            raise
-                        except Exception as exc:
-                            log.warning("Empty-reply announcement failed: %s", type(exc).__name__)
-                    completed = True
-                    return TurnOutcome.ACCEPTED
-                if now >= response_deadline:
-                    raise TimeoutError("Muse's voice reply did not complete in time")
-                try:
-                    reply = await asyncio.wait_for(self._replies.get(), 0.1)
-                except asyncio.TimeoutError:
-                    if progress_task is not None and progress_task.done():
-                        await finish_progress()
-                    await self._vary_thinking_pose_if_cooled_down()
-                    if (self._input_overflow and progress_task is None and self.backends.voice.speaks_text
-                            and not self._has_output() and not self._playback.user_speaking):
-                        self._input_overflow = False
-                        progress_task = asyncio.create_task(self._speak(
-                            None, text=INPUT_OVERFLOW_CUE, state="thinking", stream_segment=True))
-                    if (self._progress is not None and progress_task is None and not played
-                            and not self._has_output() and not self._playback.user_speaking):
-                        progress = self._progress.take(time.monotonic())
-                        if progress is not None:
-                            log.info("Reachy selected %s progress %.1fs after the voice turn",
-                                     progress.source, time.monotonic() - started)
-                            progress_task = asyncio.create_task(
-                                self._say_progress(request_text, progress.text, progress_said))
-                    if (style is ReplyStyle.EXPRESSIVE_JSON and not waiting_for_segment
-                            and not self._has_output() and not self._playback.user_speaking):
-                        await self._plan(plan.Working(output=False, user_speaking=False))
-                        waiting_for_segment = True
-                    continue
-                if isinstance(reply, TaskFinished):
-                    continue
-                log.info("%s next Muse reply %.1fs after the voice turn",
-                         "Queueing" if defer_playback else "Playing", now - started)
-                if isinstance(reply, SpeechSegment):
-                    message = self.tracker.messages[reply.message_id]
-                    if message["stream_revised"] or reply.index < message["stream_skip_before"]:
-                        self._discard_prepared((reply.message_id, reply.index))
-                        continue
-                    await stop_progress()
-                    def is_current(message=message, reply=reply):
-                        return not message["stream_revised"] and reply.index >= message["stream_skip_before"]
-                    if not is_current():
-                        self._discard_prepared((reply.message_id, reply.index))
-                        continue
-                    if not played and wav is not None:
-                        await self._plan(plan.AnswerArrived(output=self._has_output()))
-                    def mark_spoken(message=message):
-                        message["stream_spoken"] += 1
-                    prepared = self._prepared_speech.get((reply.message_id, reply.index))
-                    if defer_playback:
-                        self._prepared_speech.pop((reply.message_id, reply.index), None)
-                        queued_at = time.monotonic()
-                        await self._output_queue.put(_SpeechJob(
-                            reply.message_id, reply.text, reply.expression, prepared,
-                            is_current, mark_spoken, started))
-                        response_deadline += time.monotonic() - queued_at
-                        await self._queue_replies([], self.tracker)
-                        played = True
-                        continue
-                    speaking = self._speak(reply.message_id, text=reply.text, expression=reply.expression,
-                                           stream_segment=True,
-                                           prepared_stream=prepared,
-                                           is_current=is_current, on_start=mark_spoken)
-                else:
-                    await stop_progress()
-                    if not played and wav is not None:
-                        await self._plan(plan.AnswerArrived(output=self._has_output()))
-                    lines = await self.backends.narrator.lines(
-                        request_text, self.tracker.messages[reply]["text"], style, message_id=reply)
-                    if defer_playback:
-                        queued_at = time.monotonic()
-                        for line in lines:
-                            await self._output_queue.put(_SpeechJob(
-                                reply, line.text, line.expression.value if line.expression else None,
-                                started=started))
-                        response_deadline += time.monotonic() - queued_at
-                        played = True
-                        continue
-                    prepared = None
-                    speaking = self._speak_lines(reply, lines)
-                waiting_for_segment = False
-                speech_started = time.monotonic()
-                try:
-                    await self._speech_with_timeout(speaking)
-                except _SpeechSuperseded:
-                    self._discard_prepared((reply.message_id, reply.index))
-                    continue
-                finally:
-                    # Response waiting and draining accepted audio have separate budgets.
-                    response_deadline += time.monotonic() - speech_started
-                    if prepared is not None:
-                        self._prepared_speech.pop((reply.message_id, reply.index), None)
-                        await prepared.aclose()
-                if isinstance(reply, SpeechSegment):
-                    # Refill the single sentence of lookahead after the current one finishes.
-                    await self._queue_replies([], self.tracker)
-                played = True
+                    return text
+            job = await self._dispatch(wav, text, started=started, defer_playback=defer_playback)
+            outcome = await self._deliver(job)
+            completed = True
+            return outcome
         except asyncio.CancelledError:
             turn_cancelled = True
             raise
         finally:
+            job = self.job
             try:
-                try:
-                    await stop_progress()
-                finally:
-                    self._progress = None
-                    if acknowledgement_task is not None:
-                        acknowledgement_task.cancel()
-                        await asyncio.gather(acknowledgement_task, return_exceptions=True)
-                        if not turn_cancelled and not acknowledgement_task.cancelled():
-                            acknowledgement_task.result()
+                if job is not None:
+                    await self._settle(job, turn_cancelled=turn_cancelled)
             finally:
                 prepared, self._prepared_speech = self._prepared_speech, {}
                 await asyncio.gather(*(audio.aclose() for audio in prepared.values()), return_exceptions=True)
                 await asyncio.gather(*self._closing_speech, return_exceptions=True)
                 self._closing_speech.clear()
-                if self.tracker is not None:
-                    self.tracker.retire()
-                self.tracker = None
+                if job is not None:
+                    job.tracker.retire()
+                self.job = None
                 try:
                     # Deferred output owns its cleanup; backend failures cannot
                     # pause an earlier reply's shared GStreamer pipeline.
@@ -1445,6 +1251,243 @@ class VoiceConversation:
                         raise
                 finally:
                     log.info("Reachy voice turn ended")
+
+    async def _announce(self, text: str, *, started: float | None, defer_playback: bool) -> None:
+        if defer_playback:
+            await self._output_queue.put(_SpeechJob(None, text, started=started, state="listening"))
+        else:
+            await self._speak(None, text=text, state="listening", stream_segment=True)
+
+    async def _hear(self, wav: bytes, recognized_text: str | None, wake_strip_required: bool | None, *,
+                    started: float, defer_playback: bool) -> str | None | TurnOutcome:
+        """The request's words with the wake phrase removed; None when Muse hears only the audio."""
+        if not (self.backends.hearing.transcribes or recognized_text is not None):
+            return None
+        text = (recognized_text if recognized_text is not None
+                else await self.backends.hearing.transcribe(wav))
+        strip_required = (self._wake_strip_required if wake_strip_required is None
+                          else wake_strip_required)
+        if wake_strip_required is None:
+            self._wake_strip_required = False
+        if not text.strip():
+            log.info("Speech recognition outcome empty")
+            if self.wake_detector is not None and strip_required:
+                await self._announce(WAKE_CUE, started=started, defer_playback=defer_playback)
+                return TurnOutcome.WAKE_CUE
+            log.info("No words recognized in microphone input; listening again")
+            return TurnOutcome.EMPTY
+        if self.wake_detector is not None:
+            if strip_required:
+                question = question_after_wake(text, self.wake_detector.phrase)
+                # The wake detector confirms the acoustic trigger, but ASR must identify its boundary.
+                log.info("Wake transcription outcome %s", "missing_boundary" if question is None
+                         else "request" if question else "wake_only")
+                text = question or ""
+            else:
+                text = strip_wake_prefix(text, self.wake_detector.phrase)
+            if not text:
+                await self._announce(WAKE_CUE, started=started, defer_playback=defer_playback)
+                return TurnOutcome.WAKE_CUE
+        log.info("Recognized %d characters from Reachy's microphone", len(text))
+        await self._plan(plan.Working(output=self._has_output(),
+                                      user_speaking=self._playback.user_speaking))
+        return text
+
+    async def _dispatch(self, wav: bytes | None, text: str | None, *, started: float,
+                        defer_playback: bool) -> MuseJob:
+        """Send one request to Muse; the returned job is ``self.job`` until its answer is delivered."""
+        style = self.backends.reply_style()
+        job = self.job = MuseJob(
+            None if wav is None else text or "", style,
+            ReplyTracker(self.session_id, style=style, owns_chat=self.owns_chat, replay_scope=self._replay_scope),
+            started, defer_playback)
+        self._logged_activity = None
+        self._activity_log_count = 0
+        self._logged_progress_status = None
+        self._muse_status = None
+        options = {}
+        if style is ReplyStyle.MUSE_VOICE:
+            options["output_modality"] = "voice"
+        if text is not None and not self._has_output() and not self._playback.user_speaking:
+            job.acknowledgement = asyncio.create_task(self._acknowledge(text, started))
+        if wav is None:
+            ack = await self.session.send_chat(self._voice_context(style) + _SETUP_REQUEST[style],
+                                               self.session_id)
+        elif text is not None:
+            ack = await self.session.send_chat(self._ensure_muse_style(style, text),
+                                               self.session_id, **options)
+        else:
+            ack = await self.session.send_voice(wav, self.session_id, **options)
+        if not ack.get("ok"):
+            raise ConnectionError(f"Muse rejected conversation request: HTTP {ack.get('status')}")
+        response = ack.get("response")
+        if not isinstance(response, dict):
+            raise ValueError("Muse did not acknowledge the voice note")
+        if text is not None or wav is None:
+            self._muse_style = style
+        if wav is not None and self.backends.progress_voice is not None:
+            job.progress = self.backends.narrator.progress(job.request, time.monotonic())
+        await self._queue_replies(job.tracker.acknowledge(response), job)
+        self._log_backend_activity()
+        if wav is None:
+            log.info("Muse accepted Reachy's expression setup")
+        else:
+            log.info("Muse accepted a %.1f-second voice turn", max(0, len(wav) - 44) / 32000)
+        return job
+
+    async def _finish_progress(self, job: MuseJob, *, cancel: bool = False,
+                               turn_cancelled: bool = False) -> None:
+        if job.progress_speech is not None:
+            task, job.progress_speech = job.progress_speech, None
+            if cancel:
+                task.cancel()
+            result, = await asyncio.gather(task, return_exceptions=True)
+            if isinstance(result, Exception):
+                from musegadget.reachy_hardware import ReachyHardwareError
+                if isinstance(result, ReachyHardwareError) and not turn_cancelled:
+                    raise result
+                log.warning("Spoken progress failed: %s", type(result).__name__)
+
+    async def _stop_progress(self, job: MuseJob, *, turn_cancelled: bool = False) -> None:
+        if job.progress is not None:
+            job.progress.stop()
+        await self._finish_progress(job, cancel=True, turn_cancelled=turn_cancelled)
+
+    async def _settle(self, job: MuseJob, *, turn_cancelled: bool) -> None:
+        """Stop the job's own speech work: progress lines and an unfinished acknowledgement."""
+        try:
+            await self._stop_progress(job, turn_cancelled=turn_cancelled)
+        finally:
+            job.progress = None
+            if job.acknowledgement is not None:
+                job.acknowledgement.cancel()
+                await asyncio.gather(job.acknowledgement, return_exceptions=True)
+                if not turn_cancelled and not job.acknowledgement.cancelled():
+                    job.acknowledgement.result()
+
+    async def _deliver(self, job: MuseJob) -> TurnOutcome:
+        """Relay Muse's progress and answer for ``job`` until Muse is done with it."""
+        if job.acknowledgement is not None:
+            await job.acknowledgement
+        tracker = job.tracker
+        started = job.started
+        request_text = job.request or ""
+        response_deadline = job.dispatched_at + self.reply_timeout_s
+        waiting_for_segment = False
+        progress_said = []
+        while True:
+            now = time.monotonic()
+            if tracker.task_finished:
+                await self._stop_progress(job)
+            if tracker.complete(now, job.answered) and job.replies.empty():
+                return TurnOutcome.ACCEPTED
+            if not job.answered and job.replies.empty() and tracker.finished_without_text(now):
+                await self._stop_progress(job)
+                log.warning("Muse finished without reply text; returning to listening")
+                if self.backends.voice.speaks_text:
+                    from musegadget.reachy_hardware import ReachyHardwareError
+                    try:
+                        await self._announce("Muse returned an empty reply. Please try again.",
+                                             started=started, defer_playback=job.defer_playback)
+                    except ReachyHardwareError:
+                        raise
+                    except Exception as exc:
+                        log.warning("Empty-reply announcement failed: %s", type(exc).__name__)
+                return TurnOutcome.ACCEPTED
+            if now >= response_deadline:
+                raise TimeoutError("Muse's voice reply did not complete in time")
+            try:
+                reply = await asyncio.wait_for(job.replies.get(), 0.1)
+            except asyncio.TimeoutError:
+                if job.progress_speech is not None and job.progress_speech.done():
+                    await self._finish_progress(job)
+                await self._vary_thinking_pose_if_cooled_down()
+                if (self._input_overflow and job.progress_speech is None and self.backends.voice.speaks_text
+                        and not self._has_output() and not self._playback.user_speaking):
+                    self._input_overflow = False
+                    job.progress_speech = asyncio.create_task(self._speak(
+                        None, text=INPUT_OVERFLOW_CUE, state="thinking", stream_segment=True))
+                if (job.progress is not None and job.progress_speech is None and not job.answered
+                        and not self._has_output() and not self._playback.user_speaking):
+                    progress = job.progress.take(time.monotonic())
+                    if progress is not None:
+                        log.info("Reachy selected %s progress %.1fs after the voice turn",
+                                 progress.source, time.monotonic() - started)
+                        job.progress_speech = asyncio.create_task(
+                            self._say_progress(request_text, progress.text, progress_said))
+                if (job.style is ReplyStyle.EXPRESSIVE_JSON and not waiting_for_segment
+                        and not self._has_output() and not self._playback.user_speaking):
+                    await self._plan(plan.Working(output=False, user_speaking=False))
+                    waiting_for_segment = True
+                continue
+            if isinstance(reply, TaskFinished):
+                continue
+            log.info("%s next Muse reply %.1fs after the voice turn",
+                     "Queueing" if job.defer_playback else "Playing", now - started)
+            if isinstance(reply, SpeechSegment):
+                message = tracker.messages[reply.message_id]
+                if message["stream_revised"] or reply.index < message["stream_skip_before"]:
+                    self._discard_prepared((reply.message_id, reply.index))
+                    continue
+                await self._stop_progress(job)
+                def is_current(message=message, reply=reply):
+                    return not message["stream_revised"] and reply.index >= message["stream_skip_before"]
+                if not is_current():
+                    self._discard_prepared((reply.message_id, reply.index))
+                    continue
+                if not job.answered and job.request is not None:
+                    await self._plan(plan.AnswerArrived(output=self._has_output()))
+                def mark_spoken(message=message):
+                    message["stream_spoken"] += 1
+                prepared = self._prepared_speech.get((reply.message_id, reply.index))
+                if job.defer_playback:
+                    self._prepared_speech.pop((reply.message_id, reply.index), None)
+                    queued_at = time.monotonic()
+                    await self._output_queue.put(_SpeechJob(
+                        reply.message_id, reply.text, reply.expression, prepared,
+                        is_current, mark_spoken, started))
+                    response_deadline += time.monotonic() - queued_at
+                    await self._queue_replies([], job)
+                    job.answered = True
+                    continue
+                speaking = self._speak(reply.message_id, text=reply.text, expression=reply.expression,
+                                       stream_segment=True,
+                                       prepared_stream=prepared,
+                                       is_current=is_current, on_start=mark_spoken)
+            else:
+                await self._stop_progress(job)
+                if not job.answered and job.request is not None:
+                    await self._plan(plan.AnswerArrived(output=self._has_output()))
+                lines = await self.backends.narrator.lines(
+                    request_text, tracker.messages[reply]["text"], job.style, message_id=reply)
+                if job.defer_playback:
+                    queued_at = time.monotonic()
+                    for line in lines:
+                        await self._output_queue.put(_SpeechJob(
+                            reply, line.text, line.expression.value if line.expression else None,
+                            started=started))
+                    response_deadline += time.monotonic() - queued_at
+                    job.answered = True
+                    continue
+                prepared = None
+                speaking = self._speak_lines(reply, lines)
+            waiting_for_segment = False
+            speech_started = time.monotonic()
+            try:
+                await self._speech_with_timeout(speaking)
+            except _SpeechSuperseded:
+                self._discard_prepared((reply.message_id, reply.index))
+                continue
+            finally:
+                # Response waiting and draining accepted audio have separate budgets.
+                response_deadline += time.monotonic() - speech_started
+                if prepared is not None:
+                    self._prepared_speech.pop((reply.message_id, reply.index), None)
+                    await prepared.aclose()
+            if isinstance(reply, SpeechSegment):
+                # Refill the single sentence of lookahead after the current one finishes.
+                await self._queue_replies([], job)
+            job.answered = True
 
     async def _acknowledge(self, request: str, started: float) -> None:
         line = await self.backends.narrator.acknowledge(request)
