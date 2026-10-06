@@ -30,6 +30,7 @@ pairing and control protocols, so the same app pairs either.
 | Module | Role |
 |---|---|
 | `cli.py` | `musegadget pair`, `run`, `send-user-msg`, `info`, `unpair` |
+| `pair.py` | `pair()`: opens BLE setup, checks and saves the pairing, prints nothing |
 | `pairing.py` | Community pairing v5: P-256 ECDH, HKDF-SHA256, AES-256-GCM, `confirm_app` |
 | `ble_framing.py` | Chunked BLE framing (`0xFE`, index, total, payload) |
 | `ble_setup.py` | Setup commands behind the GATT characteristics (no BlueZ dependency) |
