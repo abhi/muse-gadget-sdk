@@ -325,6 +325,12 @@ standard library. The robot application itself lives outside the SDK.
 - `reachy.prompts.spoken_request(context, text)` puts a voice context before a
   spoken request, for a chat that last heard another reply style.
 - `reachy.replies.ReplyStyle` names the reply formats.
+- `reachy.replies.spoken_reply(text)` splits a reply into speech and the
+  expression from its last `[reachy:NAME]` marker.
+- `reachy.replies.SentenceStream` reads a reply as it streams, one JSON
+  sentence frame per line or plain sentences, and returns `SpokenSentence`
+  values. It raises `ReplyProtocolError` for a malformed reply and
+  `ReplyRevisionError` when the final reply changes speech already given.
 
 ## Say Muse, never Hatch
 
