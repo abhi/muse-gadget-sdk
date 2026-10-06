@@ -139,6 +139,12 @@ def noise_url(noise_host: str, vm_id: str) -> str:
     return f"wss://{noise_host}{NOISE_PATH}?vm_id={quote(vm_id, safe=_URI_COMPONENT_SAFE)}"
 
 
+@dataclass(frozen=True)
+class SideChat:
+    session_id: str
+    exists: bool    # False: Muse has no chat with this ID yet; the first send_chat to it creates it
+
+
 class LinkSession:
     def __init__(
         self,
@@ -389,6 +395,25 @@ class LinkSession:
                 await self._reset_stream(encrypted.stream_id)
             stream.close()
 
+    async def open_side_chat(self, session_id: str) -> SideChat:
+        """Look up the side chat ``session_id`` without reading its events.
+
+        Raises :class:`HttpStreamError` when Muse answers with anything but
+        success or 404.
+        """
+        path = "/chat/subscribe"
+        body = json.dumps({"session_id": session_id}).encode()
+        async with self.stream_http("POST", path, body, headers=[
+            Header("Content-Type", "application/json"), Header("Accept", "application/x-ndjson"),
+        ]) as stream:
+            if 200 <= stream.status < 300:
+                exists = True
+            elif stream.status == 404:
+                exists = False
+            else:
+                raise HttpStreamError(stream.status, path)
+        return SideChat(session_id, exists)
+
     async def subscribe_chat(self, session_id: str | None = None) -> AsyncIterator[dict]:
         """Yield Muse chat events from its NDJSON subscription."""
         body = json.dumps({"session_id": session_id} if session_id else {}).encode()
@@ -594,6 +619,28 @@ class HttpStreamError(ConnectionError):
         super().__init__(f"Muse request {path} failed: HTTP {status}")
         self.status = status
         self.path = path
+
+
+class RequestRejected(ConnectionError):
+    """Muse refused a ``send_chat`` or ``send_voice`` request."""
+
+    def __init__(self, status: int | None) -> None:
+        super().__init__(f"Muse rejected conversation request: HTTP {status}")
+        self.status = status
+
+
+def acknowledgement(result: dict) -> dict:
+    """Muse's acknowledgement in a ``send_chat`` or ``send_voice`` result.
+
+    Raises :class:`RequestRejected` when Muse refused the request, and
+    ``ValueError`` when it accepted it without an acknowledgement.
+    """
+    if not result.get("ok"):
+        raise RequestRejected(result.get("status"))
+    response = result.get("response")
+    if not isinstance(response, dict):
+        raise ValueError("Muse did not acknowledge the request")
+    return response
 
 
 class HttpStream:
