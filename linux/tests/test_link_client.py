@@ -24,8 +24,8 @@ import wave
 import pytest
 
 from musegadget.link_client import (
-    DeviceDescription, HttpStreamError, LinkSession, MessageDecoder, Outcome, describe_result,
-    encode_message, noise_url, printable,
+    DeviceDescription, HttpStreamError, LinkSession, MessageDecoder, Outcome, RequestRejected, SideChat,
+    acknowledgement, describe_result, encode_message, noise_url, printable,
 )
 from musegadget.noise import (
     ApplicationResponse, BodyChunk, Header, NoiseFrameDecoder, NoiseXXResponder, ServiceFrame,
@@ -510,6 +510,44 @@ def test_tts_http_errors_have_status_without_exposing_response_body(status):
     asyncio.run(bounded_scenario(scenario()))
 
 
+@pytest.mark.parametrize("status, exists", [(200, True), (404, False)])
+def test_opening_a_side_chat_reports_whether_muse_has_it(status, exists):
+    async def scenario():
+        session, vm, stop, task = await registered_session()
+        lookup = asyncio.ensure_future(session.open_side_chat("robot-chat"))
+        request = await vm.next_frame()
+        assert request.value.path == "/chat/subscribe"
+        assert json.loads(request.value.body) == {"session_id": "robot-chat"}
+        await vm.send_frame(ServiceFrame.response(request.stream_id, ApplicationResponse(
+            status=status, end_body=False,
+        )))
+        assert await lookup == SideChat("robot-chat", exists=exists)
+        reset = await vm.next_frame()
+        assert (reset.kind, reset.stream_id) == ("reset", request.stream_id)
+        assert not session.chat_subscribed.is_set()
+        stop.set()
+        await task
+
+    asyncio.run(bounded_scenario(scenario()))
+
+
+def test_a_side_chat_muse_refuses_raises_its_status():
+    async def scenario():
+        session, vm, stop, task = await registered_session()
+        lookup = asyncio.ensure_future(session.open_side_chat("robot-chat"))
+        request = await vm.next_frame()
+        await vm.send_frame(ServiceFrame.response(request.stream_id, ApplicationResponse(
+            status=403, body=b"private server response", end_body=True,
+        )))
+        with pytest.raises(HttpStreamError) as error:
+            await lookup
+        assert (error.value.status, error.value.path) == (403, "/chat/subscribe")
+        stop.set()
+        await task
+
+    asyncio.run(bounded_scenario(scenario()))
+
+
 def test_closing_subscription_resets_only_that_stream():
     async def scenario():
         session, vm, stop, task = await registered_session()
@@ -705,3 +743,18 @@ def test_cancelled_multiframe_send_preserves_noise_nonces_for_next_request(cance
         await task
 
     asyncio.run(bounded_scenario(scenario()))
+
+
+def test_acknowledgement_returns_what_muse_acknowledged():
+    assert acknowledgement({"ok": True, "status": 200, "response": {"message_id": "m-1"}}) == {
+        "message_id": "m-1"}
+
+
+def test_acknowledgement_raises_for_a_refused_or_unacknowledged_request():
+    with pytest.raises(RequestRejected) as rejected:
+        acknowledgement({"ok": False, "status": 429, "response": {"error": "busy"}})
+    assert (rejected.value.status, str(rejected.value)) == (
+        429, "Muse rejected conversation request: HTTP 429")
+    assert isinstance(rejected.value, ConnectionError)
+    with pytest.raises(ValueError, match="^Muse did not acknowledge the request$"):
+        acknowledgement({"ok": True, "status": 200, "response": "accepted"})
