@@ -40,6 +40,7 @@ pairing and control protocols, so the same app pairs either.
 | `link_client.py` | One session: `/v1/noise` upgrade, Noise XX, `/link-control`, `/chat/stream`, `/chat/subscribe`, TTS streams |
 | `service.py` | `musegadget run`: reconnect loop, token rotation, local socket |
 | `muse_turn.py` | Follows one request through Muse's chat events to its replies |
+| `reachy/` | The Reachy Mini contract with Muse: commands, expressions, prompts, reply formats |
 | `executor.py`, `fileops.py` | The commands Muse can run, as the chosen account |
 | `noise/` | Noise XX handshake, framing and service envelopes |
 | `data/` | The systemd unit and the hash-pinned `requirements.lock`, shipped in the package |
@@ -294,6 +295,36 @@ run_command=...)` is one encrypted session with a Muse VM.
   `ReplayScope.retire_request(response)` retires a request that no turn
   follows. `ReplayScope.observe_idle(event, session_id)` retires an event
   seen while no turn is open.
+
+### The Reachy Mini contract
+
+`musegadget.reachy` holds what Muse and Reachy Mini agree on. It uses only the
+standard library. The robot application itself lives outside the SDK.
+
+- `reachy.commands.COMMAND_SPECS` lists the commands Muse can call on Reachy:
+  `reachy.expression` and `reachy.move`.
+- `reachy.commands.parse_command(name, params, *, antenna_mode, timeout_ms)`
+  checks one call and returns a `Command` with the defaults filled in. It
+  raises `ValueError` that names the first problem.
+- `reachy.commands.POSE_LIMITS` maps each pose and antenna parameter to its
+  `(low, high)` range in millimetres or degrees.
+- `reachy.expressions.Expression` lists the expressions that Muse can name in
+  a reply. `Expression.parse(name)` returns None for an unknown name.
+- `reachy.prompts.voice_context(style, ...)` describes Reachy and the reply
+  format to Muse. It also records whether motion, each antenna and face
+  tracking are on.
+- `reachy.prompts.SETUP_REQUEST` maps each `ReplyStyle` to the text that asks
+  Muse to start answering in that style.
+- `reachy.prompts.CHAT_SETUP_PREFIX` and `reachy.prompts.CHAT_SETUP_SUFFIX` go
+  before and after a voice context to make the setup message for Reachy's side
+  chat. `reachy.prompts.CHAT_SETUP_MESSAGE` is the two with no context between.
+- `reachy.prompts.with_setup_challenge(setup_message, nonce)` appends the
+  setup challenge to a setup message. Muse answers it with exactly
+  `reachy.prompts.setup_challenge_reply(nonce)`.
+- `reachy.prompts.STOP_REQUEST` asks Muse to stop working on the last request.
+- `reachy.prompts.spoken_request(context, text)` puts a voice context before a
+  spoken request, for a chat that last heard another reply style.
+- `reachy.replies.ReplyStyle` names the reply formats.
 
 ## Say Muse, never Hatch
 
