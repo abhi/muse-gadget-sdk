@@ -128,25 +128,41 @@ class Service:
             log.info("reconnecting in %.0fs", delay)
             await self._sleep(delay)
 
-    async def _session(self, vm: dict, pairing: dict) -> tuple[Outcome, float]:
-        device = DeviceDescription(
+    def describe(self) -> DeviceDescription:
+        """Describe the device to register with Muse for each session."""
+        return DeviceDescription(
             node_id=self.identity.node_id,
             display_name=self.display_name,
             version=__version__,
             commands=COMMAND_SPECS,
         )
+
+    def run_command(self, name: str, params: dict, timeout_ms: int | None = None) -> dict:
+        """Handle one command from Muse. LinkSession calls this in a worker thread."""
+        return self.executor.run(name, params, timeout_ms)
+
+    async def serve(self, session: LinkSession, vm: dict, stop: asyncio.Event) -> Outcome:
+        """Run one session until it ends or ``stop`` is set, and return how it ended.
+
+        Override to run the gadget's own work beside ``session.run(stop)``.
+        Clean up that work before returning the session's outcome. An active
+        local message socket forwards to this session while it is registered.
+        """
+        return await session.run(stop)
+
+    async def _session(self, vm: dict, pairing: dict) -> tuple[Outcome, float]:
         session = LinkSession(
             noise_host=pairing.get("noise_host") or DEFAULT_NOISE_HOST,
             vm_id=vm["vm_id"] or vm["vm_name"],
             vm_auth_token=vm["vm_auth_token"],
-            device=device,
-            run_command=self.executor.run,
+            device=self.describe(),
+            run_command=self.run_command,
         )
         log.info("connecting to %s", vm["vm_name"] or vm["vm_id"])
         started = time.monotonic()
         self._current = session
         try:
-            outcome = await session.run(self._stop)
+            outcome = await self.serve(session, vm, self._stop)
         except Exception as exc:
             log.warning("session failed: %s: %s", type(exc).__name__, exc)
             outcome = Outcome.CLOSED

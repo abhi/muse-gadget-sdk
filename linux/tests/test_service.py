@@ -24,10 +24,14 @@ from pathlib import Path
 
 import pytest
 
-from musegadget import muse_api
+from musegadget import config, muse_api
 from musegadget.executor import Account, Executor
 from musegadget.identity import Identity
+from musegadget.link_client import DeviceDescription, Outcome
+from musegadget.noise import ApplicationResponse, ServiceFrame
 from musegadget.service import Backoff, Service
+
+from test_link_client import FakeVm, Pipe, bounded_scenario
 
 
 class FakeSession:
@@ -107,6 +111,123 @@ def test_local_message_must_be_non_empty_text():
         assert not reply["ok"] and "JSONDecodeError" in reply["error"]
 
     run_with_socket(check)
+
+
+@pytest.fixture
+def paired_device(tmp_path, monkeypatch):
+    monkeypatch.setenv(config.STATE_DIR_ENV, str(tmp_path))
+    config.save_json(config.PAIRING_FILE, fresh_pairing())
+    vm = {"is_default": True, "vm_id": "vm-1", "vm_name": "muse", "vm_auth_token": "vm-token"}
+    monkeypatch.setattr(muse_api, "fetch_vms_with_status", lambda token, api: ([vm], 200))
+
+
+@pytest.mark.parametrize("failure", [None, "connection", "hook"])
+def test_a_subclass_runs_its_own_device_and_work_on_the_service_session(paired_device, monkeypatch, failure):
+    monkeypatch.setattr("musegadget.service.BACKOFF_BASE_S", 0)
+    served = []
+    commands = {"lamp.on": {"description": "Turn on the lamp", "required": {}, "optional": {}}}
+
+    class Lamp(Service):
+        def describe(self):
+            return DeviceDescription(self.identity.node_id, "Lamp", "2.0", commands)
+
+        def run_command(self, name, params, timeout_ms=None):
+            return {"ok": True, "payload": {"command": name, "params": params, "timeout_ms": timeout_ms}}
+
+        async def serve(self, session, vm, stop):
+            served.append(vm["vm_id"])
+            if failure == "hook" and len(served) == 1:
+                raise ConnectionError("temporary gadget failure")
+            return await super().serve(session, vm, stop)
+
+    async def scenario():
+        to_device, to_vm = asyncio.Queue(), asyncio.Queue()
+        device_ws = Pipe(to_device, to_vm)
+        vm = FakeVm(Pipe(to_vm, to_device))
+        connects = []
+
+        async def connect(url, **kwargs):
+            connects.append((url, kwargs["additional_headers"]))
+            if failure == "connection" and len(connects) == 1:
+                raise ConnectionError("temporary network failure")
+            return device_ws
+
+        monkeypatch.setattr("websockets.asyncio.client.connect", connect)
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            lamp = Lamp(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current()))
+            path = Path(tmp) / "mg.sock"
+            server = await lamp.serve_local(path)
+
+            async def use_gadget():
+                await vm.handshake()
+                await vm.accept_control_stream()
+                register = await vm.next_message()
+                assert register["method"] == "link.register"
+                assert register["params"] == {
+                    "node_id": "homelink-000001", "display_name": "Lamp", "version": "2.0",
+                    "platform": "linux", "device_family": "homehub", "model_id": "linux",
+                    "is_wakeup_supported": False,
+                    "commands_v2": {"lamp.on": {"description": "Turn on the lamp", "required": {}, "optional": {}}},
+                }
+                await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+                await vm.send_message({
+                    "method": "link.invoke", "id": "inv-1", "command": "lamp.on",
+                    "params": {"brightness": 50}, "timeout_ms": 1000,
+                })
+                assert await vm.next_message() == {
+                    "method": "link.result", "id": "inv-1", "ok": True,
+                    "payload": {"command": "lamp.on", "params": {"brightness": 50}, "timeout_ms": 1000},
+                }
+                message = asyncio.ensure_future(ask(path, b'{"message": "hi"}\n'))
+                request = await vm.next_frame()
+                assert (request.value.verb, request.value.path) == ("POST", "/chat/stream")
+                assert json.loads(request.value.body) == {
+                    "message": "hi", "output_modality": "text", "device_id": "homelink-000001",
+                }
+                await vm.send_frame(ServiceFrame.response(request.stream_id, ApplicationResponse(
+                    status=200, body=b'{"message_id":"user-1"}', end_body=True,
+                )))
+                assert await message == {"ok": True, "status": 200, "response": {"message_id": "user-1"}}
+                lamp.stop()
+
+            tasks = [asyncio.ensure_future(lamp.run()), asyncio.ensure_future(use_gadget())]
+            try:
+                await asyncio.gather(*tasks)
+                assert await ask(path, b'{"message": "late"}\n') == {
+                    "ok": False, "error": "not connected to the Muse",
+                }
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                server.close()
+                await server.wait_closed()
+        assert connects == [
+            ("wss://hatch.metaaivm.com/v1/noise?vm_id=vm-1", {"Authorization": "Bearer vm-token"}),
+        ] * (2 if failure == "connection" else 1)
+
+    asyncio.run(bounded_scenario(scenario()))
+    assert served == (["vm-1", "vm-1"] if failure else ["vm-1"])
+
+
+def test_cancelling_a_service_does_not_reconnect(paired_device):
+    async def scenario():
+        started = asyncio.Event()
+
+        class Lamp(Service):
+            async def serve(self, session, vm, stop):
+                started.set()
+                await stop.wait()
+                return Outcome.STOPPED
+
+        lamp = Lamp(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current()))
+        task = asyncio.ensure_future(lamp.run())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(bounded_scenario(scenario()))
 
 
 def test_backoff_doubles_to_a_ceiling_and_honours_the_floor():
